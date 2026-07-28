@@ -1,7 +1,7 @@
 import pandas as pd
 import re
 import numpy as np
-from config import RAW_DIR, TARGET_COLS
+from config import RAW_DIR, TARGET_COLS, CAPACITY_KWH
 
 def aggregate_weather(df, prefix):
     """격자별 기상 데이터를 시간대별 평균으로 집계"""
@@ -453,9 +453,24 @@ def get_tabular_data():
         test_df[f"ws117_gfs_grid_{gfs_g3}"], lookup_gfs_unison, n_turbines=5
     )
 
+    # ── 발전량 재정의용 변수 (Y 사용 -> train_df 전용, X 피처에는 절대 포함하면 안 됨) ──
+    baseline_cols = {
+        "kpx_group_1": "power_curve_pred_lookup_group1_gfs",
+        "kpx_group_2": "power_curve_pred_lookup_group2_gfs",
+        "kpx_group_3": "power_curve_pred_lookup_group3_gfs",
+    }
+    for target_col, capacity in CAPACITY_KWH.items():
+        train_df = add_capacity_factor_group(train_df, target_col, capacity)
+        train_df = add_turbine_efficiency_ratio_group(train_df, target_col)
+        train_df = add_generation_residual_group(train_df, target_col, baseline_cols[target_col])
+
+    # X_train/X_test 피처에서는 타겟 및 타겟 파생 변수(리키지) 전부 제외
+    leak_cols = [c for c in train_df.columns
+                 if c.startswith(("capacity_factor_", "turbine_efficiency_ratio_", "generation_residual_"))]
+
     X_train = pd.concat([
         calendar_features(train_df["forecast_kst_dtm"]),
-        train_df.drop(columns=["forecast_kst_dtm", *TARGET_COLS])
+        train_df.drop(columns=["forecast_kst_dtm", *TARGET_COLS, *leak_cols])
     ], axis=1)
 
     X_test = pd.concat([
@@ -928,6 +943,23 @@ def add_power_curve_pred_group3_gfs(df, grid_id):
     pred[flat] = 21000
     df["power_curve_pred_group3_gfs"] = pred
     return df
+
+
+########## 발전량 (Y 사용, train 전용 — 타겟 재정의/분석용) ##########
+# group[i] 설비 이용률 (Y / Capacity_i) — 0~1 스케일 타겟 후보
+def add_capacity_factor_group(train_df, target_col, capacity):
+    train_df[f"capacity_factor_{target_col}"] = train_df[target_col] / capacity
+    return train_df
+
+# group[i] 터빈 효율 지수 (Y / 바람 운동 에너지 플럭스) — 효율 스케일 타겟 후보
+def add_turbine_efficiency_ratio_group(train_df, target_col, flux_col="wind_energy_flux_ldaps", eps=1e-8):
+    train_df[f"turbine_efficiency_ratio_{target_col}"] = train_df[target_col] / (train_df[flux_col] + eps)
+    return train_df
+
+# group[i] 파워커브(baseline) 대비 발전량 잔차 (Y - baseline) — 잔차 스케일 타겟 후보
+def add_generation_residual_group(train_df, target_col, baseline_col):
+    train_df[f"generation_residual_{target_col}"] = train_df[target_col] - train_df[baseline_col]
+    return train_df
 
 
 ########## 기타-기상예보 ##########

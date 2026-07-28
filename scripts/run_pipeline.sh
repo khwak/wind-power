@@ -7,13 +7,17 @@ eval "$(conda shell.bash hook)"
 conda activate wind
 
 # 실행 모드 설정 (chronos, ensemble, chronos_ensemble 중 택 1)
-MODE="chronos_ensemble"
+# 'autogluon', 'ensemble', 'ag_ensemble'
+# 'final', 'search'
+MODE="search"
 
 echo "=== [1/4] prepare_data.py 시작: $(date) ==="
 python prepare_data.py
+# python prepare_data_B.py
 
 echo "=== [2/4] train.py 시작 (Mode: $MODE): $(date) ==="
 python train.py --mode $MODE
+# python train_B.py --mode $MODE
 
 echo "=== [3/4] evaluate.py 시작: $(date) ==="
 python evaluate.py
