@@ -1,1033 +1,1280 @@
-import pandas as pd
+from __future__ import annotations
+
 import re
+from pathlib import Path
+from typing import Iterable
+
 import numpy as np
-from config import RAW_DIR, TARGET_COLS
+import pandas as pd
 
-def aggregate_weather(df, prefix):
-    """격자별 기상 데이터를 시간대별 평균으로 집계"""
-    df = df.copy()
-    df["forecast_kst_dtm"] = pd.to_datetime(df["forecast_kst_dtm"])
-    drop_cols = {"data_available_kst_dtm", "grid_id", "latitude", "longitude"}
-    value_cols = [c for c in df.columns if c not in {"forecast_kst_dtm", *drop_cols}]
-    
-    agg = df.groupby("forecast_kst_dtm")[value_cols].mean()
-    agg.columns = [f"{prefix}_{c}_mean" for c in agg.columns]
-    return agg.reset_index()
+from config import (
+    RAW_DIR, TARGET_COLS, GRID_SELECTION_METHOD, GRID_MANUAL_SELECTION,
+    SHEAR_BIAS_CORRECTION, GRID_DIFF_PAIRS, EXCLUDED_FEATURES,
+)
 
-def calendar_features(dt_series):
-    """기본 캘린더 피처 생성"""
+HUB_HEIGHT_M = 117.0
+PREDICTION_REFERENCE_OFFSET_HOURS = 0
+
+GROUP_META = {
+    1: {
+        "maker": "vestas",
+        "turbines": list(range(1, 7)),
+        "n_turbines": 6,
+        "power_feature": "vestas_power_curve_pred_group1",
+        "variability_feature": "vestas_power_variability_group1",
+    },
+    2: {
+        "maker": "vestas",
+        "turbines": list(range(7, 13)),
+        "n_turbines": 6,
+        "power_feature": "vestas_power_curve_pred_group2",
+        "variability_feature": "vestas_power_variability_group2",
+    },
+    3: {
+        "maker": "unison",
+        "turbines": list(range(1, 6)),
+        "n_turbines": 5,
+        "power_feature": "unison_power_curve_pred",
+        "variability_feature": "unison_power_variability",
+    },
+}
+
+
+# -----------------------------------------------------------------------------
+# 공통 유틸
+# -----------------------------------------------------------------------------
+def _parse_times(*frames: pd.DataFrame) -> None:
+    """존재하는 시간 컬럼을 모두 datetime으로 변환한다."""
+    for frame in frames:
+        for col in ("forecast_kst_dtm", "data_available_kst_dtm", "kst_dtm"):
+            if col in frame.columns:
+                frame[col] = pd.to_datetime(frame[col])
+
+
+def calendar_features(dt_series: pd.Series) -> pd.DataFrame:
+    """예측 대상 시각에서 직접 계산 가능한 달력 피처."""
     dt = pd.to_datetime(dt_series)
     out = pd.DataFrame(index=dt.index)
-    out["month"] = dt.dt.month
-    out["hour"] = dt.dt.hour
-    out["is_weekend"] = dt.dt.dayofweek.isin([5, 6]).astype(int)
-    out["hour_sin"] = np.sin(2 * np.pi * out["hour"] / 24)
-    out["hour_cos"] = np.cos(2 * np.pi * out["hour"] / 24)
+
+    hour = dt.dt.hour
+    day_of_year = dt.dt.dayofyear
+
+    out["month"] = dt.dt.month.astype("int8")
+    out["hour"] = hour.astype("int8")
+    out["is_weekend"] = dt.dt.dayofweek.isin([5, 6]).astype("int8")
+    out["hour_sin"] = np.sin(2 * np.pi * hour / 24)
+    out["hour_cos"] = np.cos(2 * np.pi * hour / 24)
+    out["dayofyear_sin"] = np.sin(2 * np.pi * (day_of_year - 1) / 365.25)
+    out["dayofyear_cos"] = np.cos(2 * np.pi * (day_of_year - 1) / 365.25)
     return out
 
-########## 좌표/룩업 유틸 ##########
-# DMS 좌표 문자열("37°16'55.61"N 128°57'02.10"E")을 십진수(위도, 경도)로 변환
-def dms_to_decimal(dms_str):
-    parts = dms_str.strip().split()
-    def parse_one(token):
-        m = re.match(r'''(\d+)°(\d+)'([\d.]+)"([NSEW])''', token)
-        deg, minute, sec, direction = m.groups()
-        value = float(deg) + float(minute) / 60 + float(sec) / 3600
-        if direction in ("S", "W"):
-            value = -value
-        return value
-    return parse_one(parts[0]), parse_one(parts[1])
 
-# info.xlsx에서 KPX 그룹(1/2/3)별 터빈 중심 좌표 계산
-def get_kpx_group_centers(info_xlsx_path):
+def dms_to_decimal(dms_str: str) -> tuple[float, float]:
+    """DMS 좌표 문자열을 (위도, 경도) 십진수 좌표로 변환한다."""
+    if not isinstance(dms_str, str):
+        raise TypeError(f"좌표가 문자열이 아닙니다: {dms_str!r}")
+
+    pattern = re.compile(
+        r"(\d+(?:\.\d+)?)\s*°\s*(\d+(?:\.\d+)?)\s*['′]\s*"
+        r"(\d+(?:\.\d+)?)\s*[\"″]\s*([NSEW])",
+        flags=re.IGNORECASE,
+    )
+    matches = pattern.findall(dms_str.strip())
+    if len(matches) != 2:
+        raise ValueError(f"DMS 좌표 형식을 해석할 수 없습니다: {dms_str!r}")
+
+    def convert(parts: tuple[str, str, str, str]) -> float:
+        deg, minute, sec, direction = parts
+        value = float(deg) + float(minute) / 60.0 + float(sec) / 3600.0
+        if direction.upper() in {"S", "W"}:
+            value *= -1
+        return value
+
+    return convert(matches[0]), convert(matches[1])
+
+
+def get_kpx_group_centers(info_xlsx_path: Path) -> pd.DataFrame:
+    """info.xlsx에서 KPX 그룹별 터빈 중심 좌표를 계산한다."""
     info = pd.read_excel(info_xlsx_path, sheet_name="info", header=3)
     info = info.loc[:, ~info.columns.astype(str).str.startswith("Unnamed")]
-    info = info[info["호기"].notna()].reset_index(drop=True)
-    info["KPX그룹"] = info["KPX그룹"].ffill()  # 병합 셀 -> 그룹 첫 터빈에만 값이 있어서 forward fill
-    coords = info["좌표(Google)"].apply(dms_to_decimal)
-    info["lat"] = coords.apply(lambda x: x[0])
-    info["lon"] = coords.apply(lambda x: x[1])
+    info = info[info["호기"].notna()].copy()
+    info["KPX그룹"] = info["KPX그룹"].ffill().astype(int)
+
+    coords = info["좌표(Google)"].map(dms_to_decimal)
+    info["lat"] = coords.map(lambda value: value[0])
+    info["lon"] = coords.map(lambda value: value[1])
     return info.groupby("KPX그룹")[["lat", "lon"]].mean()
 
-# 중심 좌표와 가장 가까운 LDAPS 격자(grid_id) 탐색
-def nearest_ldaps_grid_id(center_lat, center_lon, ldaps_df):
-    grids = ldaps_df[["grid_id", "latitude", "longitude"]].drop_duplicates()
-    dist = np.sqrt((grids["latitude"] - center_lat) ** 2 + (grids["longitude"] - center_lon) ** 2)
-    return int(grids.loc[dist.idxmin(), "grid_id"])
 
-# 중심 좌표와 가장 가까운 GFS 격자(grid_id) 탐색
-def nearest_gfs_grid_id(center_lat, center_lon, gfs_df):
-    grids = gfs_df[["grid_id", "latitude", "longitude"]].drop_duplicates()
-    dist = np.sqrt((grids["latitude"] - center_lat) ** 2 + (grids["longitude"] - center_lon) ** 2)
-    return int(grids.loc[dist.idxmin(), "grid_id"])
+def _haversine_km(lat1, lon1, lat2, lon2):
+    """위경도 사이 대권거리(km)."""
+    radius = 6371.0088
+    lat1 = np.radians(lat1)
+    lon1 = np.radians(lon1)
+    lat2 = np.radians(lat2)
+    lon2 = np.radians(lon2)
 
-# 풍속bin -> 터빈 1기당 중앙값 발전량 룩업 테이블 생성 (train SCADA 전용, fit 단계)
-# 주의: 그룹 내 터빈들의 (발전량, 풍속) 쌍을 전부 풀링해서 "터빈 1기 기준" 중앙값으로 만듦
-#       (원래 명세서 로직은 터빈별 실측 풍속으로 각자 계산해 합산하지만,
-#        apply 단계에서는 LDAPS 예보 풍속 1개만 쓸 수 있어서 이렇게 단순화함)
-def fit_power_curve_lookup(scada_train, turbines, power_suffix="_power_kw10m", ws_suffix="_ws",
-                            ws_bin_width=0.5, min_count=30):
-    pooled = pd.concat([
-        pd.DataFrame({
-            "power": scada_train[f"{wtg}{power_suffix}"],
-            "ws": scada_train[f"{wtg}{ws_suffix}"],
-        })
-        for wtg in turbines
-    ], ignore_index=True).dropna()
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = (
+        np.sin(dlat / 2) ** 2
+        + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    )
+    return 2 * radius * np.arcsin(np.sqrt(a))
 
+
+def nearest_ldaps_grid_id(
+    center_lat: float,
+    center_lon: float,
+    ldaps_df: pd.DataFrame,
+) -> int:
+    """그룹 중심과 가장 가까운 LDAPS 격자를 찾는다."""
+    grids = (
+        ldaps_df[["grid_id", "latitude", "longitude"]]
+        .drop_duplicates("grid_id")
+        .copy()
+    )
+    grids["distance_km"] = _haversine_km(
+        center_lat,
+        center_lon,
+        grids["latitude"].to_numpy(),
+        grids["longitude"].to_numpy(),
+    )
+    return int(grids.loc[grids["distance_km"].idxmin(), "grid_id"])
+
+def select_group_grid_id(
+    group: int,
+    center_lat: float,
+    center_lon: float,
+    ldaps_train_grid: pd.DataFrame,
+    train_labels_all: pd.DataFrame,
+    target_col: str,
+    cutoff: pd.Timestamp,
+    method: str = "nearest",
+    manual_selection: dict[int, int] | None = None,
+) -> int:
+    if method == "nearest":
+        return nearest_ldaps_grid_id(center_lat, center_lon, ldaps_train_grid)
+
+    if method == "manual":
+        if manual_selection is None or group not in manual_selection:
+            raise ValueError(f"GRID_MANUAL_SELECTION에 그룹 {group} 값이 없습니다.")
+        return manual_selection[group]
+    
+    if method == "correlation":
+        fit_rows = ldaps_train_grid[ldaps_train_grid["forecast_kst_dtm"] < cutoff]
+        labels = train_labels_all[["kst_dtm", target_col]].rename(
+            columns={"kst_dtm": "forecast_kst_dtm"}
+        )
+        merged = fit_rows.merge(labels, on="forecast_kst_dtm", how="inner").dropna(
+            subset=["ws117_power_ldaps", target_col]
+        )
+        if merged.empty:
+            raise ValueError(f"그룹 {group}: 상관관계 계산할 표본이 없습니다.")
+
+        corr_by_grid = (
+            merged.groupby("grid_id")
+            .apply(lambda g: g["ws117_power_ldaps"].corr(g[target_col]))
+            .dropna()
+        )
+        if corr_by_grid.empty:
+            raise ValueError(f"그룹 {group}: 유효한 상관관계가 없습니다.")
+        return int(corr_by_grid.idxmax())
+
+    raise ValueError(f"알 수 없는 grid 선택 방식: {method}")
+
+def diagnose_grid_correlation(
+    ldaps_train_grid: pd.DataFrame,
+    train_labels_all: pd.DataFrame,
+    cutoff: pd.Timestamp,
+) -> pd.DataFrame:
+    """그룹별로 16개 격자 전부의 상관계수를 보여준다. 1등과 2등 차이가 작으면
+    correlation 방식의 '승자'가 사실상 노이즈일 가능성이 높다는 뜻이다."""
+    rows = []
+    for group in GROUP_META:
+        target_col = f"kpx_group_{group}"
+        fit_rows = ldaps_train_grid[ldaps_train_grid["forecast_kst_dtm"] < cutoff]
+        labels = train_labels_all[["kst_dtm", target_col]].rename(columns={"kst_dtm": "forecast_kst_dtm"})
+        merged = fit_rows.merge(labels, on="forecast_kst_dtm", how="inner").dropna(
+            subset=["ws117_power_ldaps", target_col]
+        )
+        corr = merged.groupby("grid_id").apply(
+            lambda g: g["ws117_power_ldaps"].corr(g[target_col])
+        ).sort_values(ascending=False)
+        corr_df = corr.reset_index()
+        corr_df.columns = ["grid_id", "correlation"]
+        corr_df["group"] = group
+        corr_df["rank"] = range(1, len(corr_df) + 1)
+        rows.append(corr_df)
+
+    result = pd.concat(rows, ignore_index=True)
+    print(result[result["rank"] <= 5].to_string(index=False))
+    return result
+
+def diagnose_shear_bias(
+    ldaps_train_grid: pd.DataFrame,
+    group_grids: dict[int, int],
+    scada_vestas_fit: pd.DataFrame,
+    scada_unison_fit: pd.DataFrame,
+    cutoff: pd.Timestamp,
+) -> pd.DataFrame:
+    """
+    그룹별 대표 격자의 외삽 117m 풍속과 SCADA 실측 풍속을 시간 단위로 매칭해 잔차를 계산한다.
+    cutoff 이전만 사용한다. 팀원 shear 분석에 그대로 쓸 수 있고, 지금 바로 셀프 진단도 가능하다.
+    """
+    rows = []
+    for group, meta in GROUP_META.items():
+        grid_id = group_grids[group]
+        ldaps_g = ldaps_train_grid[
+            (ldaps_train_grid["grid_id"] == grid_id)
+            & (ldaps_train_grid["forecast_kst_dtm"] < cutoff)
+        ][["forecast_kst_dtm", "ws117_power_ldaps", "alpha_fallback_flag"]]
+
+        scada_source = scada_vestas_fit if meta["maker"] == "vestas" else scada_unison_fit
+        turbines = _turbine_names(meta["maker"], meta["turbines"])
+        ws_cols = [f"{t}_ws" for t in turbines]
+
+        scada_hourly = scada_source[["kst_dtm"] + ws_cols].copy()
+        scada_hourly["forecast_kst_dtm"] = scada_hourly["kst_dtm"].dt.floor("h")
+        scada_hourly["scada_ws_mean"] = scada_hourly[ws_cols].mean(axis=1)
+        scada_hourly = scada_hourly.groupby("forecast_kst_dtm")["scada_ws_mean"].mean().reset_index()
+
+        merged = ldaps_g.merge(scada_hourly, on="forecast_kst_dtm", how="inner")
+        merged["group"] = group
+        merged["residual"] = merged["ws117_power_ldaps"] - merged["scada_ws_mean"]
+        rows.append(merged)
+
+    result = pd.concat(rows, ignore_index=True)
+    print(result.groupby(["group", "alpha_fallback_flag"])["residual"].agg(["count", "mean", "std"]).round(3))
+    return result
+
+
+def apply_shear_bias_correction(ws117, group: int) -> np.ndarray:
+    """SHEAR_BIAS_CORRECTION에 그룹별 보정값이 있으면 선형 보정을 적용한다.
+    없으면(기본) 원본을 그대로 반환 — 기존 동작과 100% 동일."""
+    params = SHEAR_BIAS_CORRECTION.get(group)
+    if not params:
+        return np.asarray(ws117, dtype=float)
+    scale = params.get("scale", 1.0)
+    offset = params.get("offset", 0.0)
+    return np.asarray(ws117, dtype=float) * scale + offset
+
+def _turbine_names(maker: str, turbine_numbers: Iterable[int]) -> list[str]:
+    return [f"{maker}_wtg{i:02d}" for i in turbine_numbers]
+
+
+# -----------------------------------------------------------------------------
+# 예보 가용시각과 cutoff
+# -----------------------------------------------------------------------------
+def _assert_one_issue_per_target(df: pd.DataFrame, source_name: str) -> None:
+    """한 예보 대상 시각에 복수의 사용 가능 시각이 섞였는지 검사한다."""
+    required = {"forecast_kst_dtm", "data_available_kst_dtm"}
+    missing = required - set(df.columns)
+    if missing:
+        raise KeyError(f"{source_name}에 필수 컬럼이 없습니다: {sorted(missing)}")
+
+    count = df.groupby("forecast_kst_dtm")["data_available_kst_dtm"].nunique()
+    if not count.eq(1).all():
+        bad_times = count[count.ne(1)].index[:5].tolist()
+        raise ValueError(
+            f"{source_name}: 같은 forecast_kst_dtm에 복수 예보 발행본이 섞였습니다. "
+            f"예: {bad_times}. data_available_kst_dtm 기준으로 먼저 선택해야 합니다."
+        )
+
+
+def _first_available_for_target_period(
+    ldaps: pd.DataFrame,
+    gfs: pd.DataFrame,
+    first_target: pd.Timestamp,
+) -> pd.Timestamp:
+    """첫 예측 대상 시각에 대응하는 가장 보수적인 예보 사용 가능 시각."""
+    candidates: list[pd.Timestamp] = []
+
+    for frame, name in ((ldaps, "LDAPS"), (gfs, "GFS")):
+        target_rows = frame[frame["forecast_kst_dtm"] == first_target]
+        if target_rows.empty:
+            raise ValueError(f"{name}에 첫 대상 시각 {first_target} 행이 없습니다.")
+        available_values = target_rows["data_available_kst_dtm"].dropna().unique()
+        if len(available_values) != 1:
+            raise ValueError(
+                f"{name}의 첫 대상 시각 {first_target}에 사용 가능 시각이 "
+                f"정확히 1개가 아닙니다: {available_values}"
+            )
+        candidates.append(pd.Timestamp(available_values[0]))
+
+    # 두 소스가 다르면 더 이른 시각을 cutoff로 잡는 것이 실제 관측자료 사용에는 보수적이다.
+    return min(candidates)
+
+
+def _resolve_cutoff(
+    mode: str,
+    validation_start: str | pd.Timestamp | None,
+    ldaps_train: pd.DataFrame,
+    gfs_train: pd.DataFrame,
+    ldaps_test: pd.DataFrame,
+    gfs_test: pd.DataFrame,
+    prediction_reference_offset_hours: int,
+) -> tuple[pd.Timestamp, pd.Timestamp | None]:
+    """최종 제출 또는 시간 검증에 사용할 관측자료 cutoff를 계산한다."""
+    if mode not in {"final", "validation"}:
+        raise ValueError("mode는 'final' 또는 'validation'이어야 합니다.")
+
+    if mode == "final":
+        first_target = min(
+            ldaps_test["forecast_kst_dtm"].min(),
+            gfs_test["forecast_kst_dtm"].min(),
+        )
+        available = _first_available_for_target_period(
+            ldaps_test,
+            gfs_test,
+            first_target,
+        )
+        cutoff = available + pd.Timedelta(hours=prediction_reference_offset_hours)
+        return cutoff, None
+
+    if validation_start is None:
+        raise ValueError("mode='validation'이면 validation_start가 필요합니다.")
+
+    requested_start = pd.Timestamp(validation_start)
+    candidate_targets = sorted(
+        set(ldaps_train.loc[
+            ldaps_train["forecast_kst_dtm"] >= requested_start,
+            "forecast_kst_dtm",
+        ]).intersection(
+            set(gfs_train.loc[
+                gfs_train["forecast_kst_dtm"] >= requested_start,
+                "forecast_kst_dtm",
+            ])
+        )
+    )
+    if not candidate_targets:
+        raise ValueError(f"validation_start={requested_start} 이후 공통 예보 시각이 없습니다.")
+
+    actual_validation_start = pd.Timestamp(candidate_targets[0])
+    available = _first_available_for_target_period(
+        ldaps_train,
+        gfs_train,
+        actual_validation_start,
+    )
+    cutoff = available + pd.Timedelta(hours=prediction_reference_offset_hours)
+    return cutoff, actual_validation_start
+
+
+def _filter_observed_before(df: pd.DataFrame, cutoff: pd.Timestamp) -> pd.DataFrame:
+    """실측/라벨은 집계 종료 시각이 cutoff보다 엄격히 이전인 행만 허용한다."""
+    if "kst_dtm" not in df.columns:
+        raise KeyError("실측 데이터에 kst_dtm이 없습니다.")
+    filtered = df[df["kst_dtm"] < cutoff].copy()
+    if filtered.empty:
+        raise ValueError(f"cutoff={cutoff} 이전 실측 데이터가 없습니다.")
+    return filtered
+
+
+# -----------------------------------------------------------------------------
+# LDAPS 결측 처리와 파생변수
+# -----------------------------------------------------------------------------
+def impute_ldaps_within_issue_cycle(ldaps: pd.DataFrame) -> pd.DataFrame:
+    """
+    결측값을 같은 grid_id·같은 data_available_kst_dtm 묶음 안에서만 보간한다.
+
+    같은 예보 발행 묶음의 24시간 예보는 동시에 공개되므로, 그 묶음 안에서
+    forecast 대상 시각 앞뒤 값을 이용하는 것은 사후 관측값 사용이 아니다.
+    TRAIN과 TEST는 절대 합쳐 보간하지 않는다.
+    """
+    out = ldaps.copy()
+    out = out.sort_values(
+        ["grid_id", "data_available_kst_dtm", "forecast_kst_dtm"]
+    ).reset_index(drop=True)
+
+    id_cols = {
+        "forecast_kst_dtm",
+        "data_available_kst_dtm",
+        "grid_id",
+        "latitude",
+        "longitude",
+    }
+    numeric_cols = [
+        col for col in out.columns
+        if col not in id_cols and pd.api.types.is_numeric_dtype(out[col])
+    ]
+
+    out["ldaps_missing_flag"] = out[numeric_cols].isna().any(axis=1).astype("int8")
+
+    static_cols = [
+        col for col in ("surface_0_lsm", "surface_0_h")
+        if col in out.columns
+    ]
+    dynamic_cols = [col for col in numeric_cols if col not in static_cols]
+
+    for col in static_cols:
+        out[col] = out.groupby("grid_id", sort=False)[col].transform(
+            lambda series: series.ffill().bfill()
+        )
+
+    if dynamic_cols:
+        out[dynamic_cols] = (
+            out.groupby(
+                ["grid_id", "data_available_kst_dtm"],
+                sort=False,
+            )[dynamic_cols]
+            .transform(
+                lambda frame: frame.interpolate(
+                    method="linear",
+                    limit_direction="both",
+                )
+            )
+        )
+
+    remaining = out[dynamic_cols].isna().sum() if dynamic_cols else pd.Series(dtype=int)
+    if remaining.sum() > 0:
+        bad = remaining[remaining > 0].to_dict()
+        raise ValueError(
+            "같은 예보 발행 묶음 안에서 해결되지 않은 LDAPS 결측이 있습니다. "
+            f"다른 발행시각 자료로 채우지 말고 원인을 확인하세요: {bad}"
+        )
+    return out
+
+
+def add_ldaps_grid_features(df: pd.DataFrame) -> pd.DataFrame:
+    """한 행 내부의 예보값만으로 117m 풍속·풍향·밀도·에너지 피처를 생성한다."""
+    out = df.copy()
+
+    u10 = out["heightAboveGround_10_10u"]
+    v10 = out["heightAboveGround_10_10v"]
+    ws10 = np.hypot(u10, v10)
+
+    u50 = (
+        out["heightAboveGround_50_50MUmax"]
+        + out["heightAboveGround_50_50MUmin"]
+    ) / 2.0
+    v50 = (
+        out["heightAboveGround_50_50MVmax"]
+        + out["heightAboveGround_50_50MVmin"]
+    ) / 2.0
+    ws50 = np.hypot(u50, v50)
+
+    valid = (ws10 >= 0.5) & (ws50 >= 0.5)
+    alpha_raw = pd.Series(np.nan, index=out.index, dtype=float)
+    alpha_raw.loc[valid] = (
+        np.log(ws50.loc[valid] / ws10.loc[valid]) / np.log(50.0 / 10.0)
+    )
+
+    # 데이터 전체 분위수로 clipping 범위를 fit하지 않고 고정 물리 범위를 사용한다.
+    alpha = alpha_raw.replace([np.inf, -np.inf], np.nan).fillna(0.14).clip(-0.5, 0.6)
+    scale = (HUB_HEIGHT_M / 50.0) ** alpha
+    u117 = u50 * scale
+    v117 = v50 * scale
+
+    out["alpha_shear_ldaps"] = alpha
+    out["alpha_fallback_flag"] = (~valid).astype("int8")
+    out["ws117_power_ldaps"] = np.hypot(u117, v117)
+    out["wd117_ldaps"] = np.degrees(np.arctan2(-u117, -v117)) % 360
+
+    temperature_k = out["heightAboveGround_2_t"].clip(lower=180.0)
+    specific_humidity = out["heightAboveGround_2_q"].clip(0.0, 0.05)
+    virtual_temperature = temperature_k * (1.0 + 0.61 * specific_humidity)
+    out["air_density_ldaps"] = out["surface_0_sp"] / (
+        287.058 * virtual_temperature
+    )
+    out["wind_energy_flux_grid_ldaps"] = (
+        0.5 * out["air_density_ldaps"] * out["ws117_power_ldaps"] ** 3
+    )
+    return out
+
+
+def _pivot_grid_feature(
+    df: pd.DataFrame,
+    value_col: str,
+    output_prefix: str,
+) -> pd.DataFrame:
+    wide = df.pivot(
+        index="forecast_kst_dtm",
+        columns="grid_id",
+        values=value_col,
+    )
+    wide.columns = [f"{output_prefix}_{int(grid_id)}" for grid_id in wide.columns]
+    return wide.reset_index()
+
+def add_grid_diff_features(df: pd.DataFrame, pairs: list[tuple[int, int]]) -> pd.DataFrame:
+    """지정된 격자 쌍의 ws117 차이(gradient)를 새 feature로 추가한다.
+    diff = ws117_ldaps_grid_a - ws117_ldaps_grid_b.
+    grid13 하나만으로는 못 잡는 공간적 정보를 편상관으로 확인한 뒤 반영하는 feature다."""
+    out = df.copy()
+    for a, b in pairs:
+        col_a, col_b = f"ws117_ldaps_grid_{a}", f"ws117_ldaps_grid_{b}"
+        if col_a not in out.columns or col_b not in out.columns:
+            raise KeyError(f"격자 {a} 또는 {b}의 ws117 피처가 없습니다: {col_a}, {col_b}")
+        out[f"ws117_ldaps_diff_{a}_{b}"] = out[col_a] - out[col_b]
+    return out
+
+def build_ldaps_hourly_pair(
+    ldaps_train_grid: pd.DataFrame,
+    ldaps_test_grid: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    LDAPS를 시간당 1행으로 만들고 인과 방향 시계열 피처를 계산한다.
+
+    TRAIN과 TEST를 이어 계산하는 것은 TEST 첫 구간의 24시간 lag를 TRAIN의
+    과거 예보로 연결하기 위한 것이다. 미래 방향 연산은 사용하지 않는다.
+    """
+    train = ldaps_train_grid.copy()
+    test = ldaps_test_grid.copy()
+    train["_split"] = "train"
+    test["_split"] = "test"
+    all_grid = pd.concat([train, test], ignore_index=True)
+
+    _assert_one_issue_per_target(all_grid, "LDAPS")
+
+    ws_wide = _pivot_grid_feature(
+        all_grid,
+        "ws117_power_ldaps",
+        "ws117_ldaps_grid",
+    )
+    wd_wide = _pivot_grid_feature(
+        all_grid,
+        "wd117_ldaps",
+        "wd117_ldaps_grid",
+    )
+
+    spatial = all_grid.groupby("forecast_kst_dtm", as_index=False).agg(
+        ws117_ldaps_spatial_mean=("ws117_power_ldaps", "mean"),
+        ws117_ldaps_spatial_std=("ws117_power_ldaps", "std"),
+        ws117_ldaps_spatial_min=("ws117_power_ldaps", "min"),
+        ws117_ldaps_spatial_max=("ws117_power_ldaps", "max"),
+        alpha_shear_ldaps=("alpha_shear_ldaps", "mean"),
+        air_density_ldaps=("air_density_ldaps", "mean"),
+        prmsl_range_ldaps=("meanSea_0_prmsl", lambda values: values.max() - values.min()),
+        wind_energy_flux_ldaps=("wind_energy_flux_grid_ldaps", "mean"),
+        ldaps_missing_flag=("ldaps_missing_flag", "max"),
+        alpha_fallback_fraction=("alpha_fallback_flag", "mean"),
+        ldaps_data_available_kst_dtm=("data_available_kst_dtm", "first"),
+        _split=("_split", "first"),
+    )
+
+    hourly = (
+        ws_wide
+        .merge(wd_wide, on="forecast_kst_dtm", how="left", validate="one_to_one")
+        .merge(spatial, on="forecast_kst_dtm", how="left", validate="one_to_one")
+        .sort_values("forecast_kst_dtm")
+        .reset_index(drop=True)
+    )
+
+    hourly = add_grid_diff_features(hourly, GRID_DIFF_PAIRS)  # 격자 간 gradient feature
+    hourly["ws117_cube_ldaps"] = hourly["ws117_ldaps_spatial_mean"] ** 3
+    hourly["ldaps_lead_hour"] = (
+        hourly["forecast_kst_dtm"]
+        - pd.to_datetime(hourly["ldaps_data_available_kst_dtm"])
+    ).dt.total_seconds() / 3600.0
+
+    # target 시간이 증가할 때 예보 사용 가능 시각이 뒤로 돌아가면 lag 안전성을 재검토해야 한다.
+    if not hourly["ldaps_data_available_kst_dtm"].is_monotonic_increasing:
+        raise ValueError(
+            "LDAPS data_available_kst_dtm이 target 시간순으로 단조 증가하지 않습니다."
+        )
+
+    base = hourly["ws117_ldaps_spatial_mean"]
+    hourly["ws117_diff_1h_ldaps"] = base.diff(1)
+    hourly["ws117_lag_24h_ldaps"] = base.shift(24)
+    hourly["ws117_roll_mean_6h_ldaps"] = base.rolling(
+        window=6,
+        min_periods=1,
+        center=False,
+    ).mean()
+    hourly["ws117_roll_std_6h_ldaps"] = base.rolling(
+        window=6,
+        min_periods=2,
+        center=False,
+    ).std()
+
+    train_out = (
+        hourly[hourly["_split"] == "train"]
+        .drop(columns="_split")
+        .reset_index(drop=True)
+    )
+    test_out = (
+        hourly[hourly["_split"] == "test"]
+        .drop(columns="_split")
+        .reset_index(drop=True)
+    )
+    return train_out, test_out
+
+
+# -----------------------------------------------------------------------------
+# GFS 피처와 공간 집계
+# -----------------------------------------------------------------------------
+def add_gfs_features(df: pd.DataFrame) -> pd.DataFrame:
+    """GFS 한 행 내부의 예보값만 사용하는 안전한 파생변수."""
+    out = df.copy()
+    ws10 = np.hypot(
+        out["heightAboveGround_10_10u"],
+        out["heightAboveGround_10_10v"],
+    )
+    out["ws10_gfs"] = ws10
+    out["gust_excess_gfs"] = (out["surface_0_gust"] - ws10).clip(lower=0)
+    out["calm_wind_flag_gfs"] = (ws10 < 0.5).astype("int8")
+    out["gust_factor_proxy_gfs"] = (
+        out["surface_0_gust"] / ws10.clip(lower=0.5)
+    ).clip(0, 5)
+    return out
+
+
+def aggregate_weather(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    """
+    격자별 예보를 시간당 평균으로 집계한다.
+
+    원본과 달리 data_available_kst_dtm을 버리지 않고 보존하며,
+    같은 target 시각에 복수 발행본이 섞였는지 먼저 검사한다.
+    """
+    frame = df.copy()
+    _assert_one_issue_per_target(frame, prefix.upper())
+
+    excluded = {
+        "forecast_kst_dtm",
+        "data_available_kst_dtm",
+        "grid_id",
+        "latitude",
+        "longitude",
+    }
+    value_cols = [
+        col for col in frame.columns
+        if col not in excluded and pd.api.types.is_numeric_dtype(frame[col])
+    ]
+
+    mean_values = frame.groupby("forecast_kst_dtm")[value_cols].mean()
+    mean_values.columns = [f"{prefix}_{col}_mean" for col in mean_values.columns]
+
+    available = (
+        frame.groupby("forecast_kst_dtm")["data_available_kst_dtm"]
+        .first()
+        .rename(f"{prefix}_data_available_kst_dtm")
+    )
+
+    out = mean_values.join(available).reset_index()
+    out[f"{prefix}_lead_hour"] = (
+        out["forecast_kst_dtm"]
+        - pd.to_datetime(out[f"{prefix}_data_available_kst_dtm"])
+    ).dt.total_seconds() / 3600.0
+    return out
+
+
+# -----------------------------------------------------------------------------
+# SCADA 룩업: 반드시 cutoff 이전 자료만 fit
+# -----------------------------------------------------------------------------
+def fit_power_curve_lookup(
+    scada_fit: pd.DataFrame,
+    turbines: list[str],
+    power_suffix: str = "_power_kw10m",
+    ws_suffix: str = "_ws",
+    ws_bin_width: float = 0.5,
+    min_count: int = 30,
+) -> pd.DataFrame:
+    """cutoff 이전 SCADA로 풍속-bin별 터빈 1기 발전량 중앙값을 학습한다."""
+    pooled_parts = []
+    for turbine in turbines:
+        pooled_parts.append(
+            pd.DataFrame({
+                "power": scada_fit[f"{turbine}{power_suffix}"],
+                "ws": scada_fit[f"{turbine}{ws_suffix}"],
+            })
+        )
+
+    pooled = pd.concat(pooled_parts, ignore_index=True).dropna()
+    pooled = pooled[np.isfinite(pooled["power"]) & np.isfinite(pooled["ws"])].copy()
+    pooled["power"] = pooled["power"].clip(lower=0)
     pooled["ws_bin"] = np.floor(pooled["ws"] / ws_bin_width)
-    lookup = pooled.groupby("ws_bin")["power"].agg(["median", "count"]).reset_index()
+
+    lookup = (
+        pooled.groupby("ws_bin")["power"]
+        .agg(median="median", count="count")
+        .reset_index()
+        .sort_values("ws_bin")
+    )
     lookup.loc[lookup["count"] < min_count, "median"] = np.nan
     lookup["median"] = lookup["median"].interpolate(limit_direction="both")
     lookup["ws_center"] = (lookup["ws_bin"] + 0.5) * ws_bin_width
-    return lookup[["ws_center", "median"]]
 
-def fit_power_curve_lookup_gfs(scada_train, turbines, v_in, v_rated, v_out, capacity,
-                                power_suffix="_power_kw10m", ws_suffix="_ws",
-                                ws_bin_width=0.5, min_count=30):
-    pooled = pd.concat([
-        pd.DataFrame({
-            "power": scada_train[f"{wtg}{power_suffix}"],
-            "ws": scada_train[f"{wtg}{ws_suffix}"],
-        })
-        for wtg in turbines
-    ], ignore_index=True).dropna()
+    lookup = lookup.dropna(subset=["median", "ws_center"])
+    if lookup.empty:
+        raise ValueError("유효한 SCADA 파워커브 룩업을 만들 수 없습니다.")
+    return lookup[["ws_center", "median", "count"]]
 
-    pooled["ws_bin"] = np.floor(pooled["ws"] / ws_bin_width)
-    observed = pooled.groupby("ws_bin")["power"].agg(["median", "count"]).reset_index()
+def fit_shear_calibration_lookup(
+    ldaps_ws,
+    scada_ws,
+    ws_bin_width: float = 1.0,
+    min_count: int = 30,
+) -> pd.DataFrame:
+    """cutoff 이전, 같은 그룹의 (LDAPS 117m 외삽풍속, SCADA 실측풍속) 쌍으로
+    LDAPS 풍속 -> 보정된(SCADA 등가) 풍속 룩업을 학습한다. 비선형 관계를 그대로 반영한다."""
+    pooled = pd.DataFrame({"ldaps": ldaps_ws, "scada": scada_ws}).dropna()
+    pooled = pooled[np.isfinite(pooled["ldaps"]) & np.isfinite(pooled["scada"])].copy()
+    pooled["ws_bin"] = np.floor(pooled["ldaps"] / ws_bin_width)
 
-    # 관측이 아예 없는 고풍속(컷아웃 이후 포함) 구간까지 bin을 넉넉히 만들어둠
-    max_bin = max(int(observed["ws_bin"].max()) if len(observed) else 0,
-                  int(np.ceil(v_out / ws_bin_width)) + 4)
-    lookup = pd.DataFrame({"ws_bin": np.arange(0, max_bin + 1)}).merge(observed, on="ws_bin", how="left")
-    lookup["count"] = lookup["count"].fillna(0)
-    lookup["ws_center"] = (lookup["ws_bin"] + 0.5) * ws_bin_width
+    lookup = (
+        pooled.groupby("ws_bin")["scada"]
+        .agg(median="median", count="count")
+        .reset_index()
+        .sort_values("ws_bin")
+    )
+    lookup.loc[lookup["count"] < min_count, "median"] = np.nan
+    lookup["median"] = lookup["median"].interpolate(limit_direction="both")
+    lookup["ldaps_center"] = (lookup["ws_bin"] + 0.5) * ws_bin_width
 
-    reliable = lookup["count"] >= min_count
-    lookup.loc[~reliable, "median"] = np.nan
+    lookup = lookup.dropna(subset=["median", "ldaps_center"])
+    if lookup.empty:
+        raise ValueError("유효한 shear 보정 룩업을 만들 수 없습니다.")
+    return lookup[["ldaps_center", "median", "count"]]
 
-    # 이론적 파워커브 (헬퍼 함수 분리 없이 인라인 계산)
-    ws = lookup["ws_center"].to_numpy(dtype=float)
-    theoretical = np.zeros_like(ws)
-    ramp = (ws >= v_in) & (ws < v_rated)
-    theoretical[ramp] = capacity * ((ws[ramp] - v_in) / (v_rated - v_in)) ** 3
-    flat = (ws >= v_rated) & (ws < v_out)
-    theoretical[flat] = capacity
 
-    # 정격구간(표본 충분한 bin)에서 실측/이론 비율(감쇄율)을 구해서 표본 부족 구간에 곱해서 대체
-    rated_mask = reliable.to_numpy() & (ws >= v_rated) & (ws < v_out)
-    if rated_mask.any():
-        derate_ratio = (lookup.loc[rated_mask, "median"].to_numpy() / theoretical[rated_mask]).mean()
-    else:
-        derate_ratio = 1.0
-    fallback = theoretical * derate_ratio
-    lookup["median"] = lookup["median"].fillna(pd.Series(fallback, index=lookup.index))
+def apply_shear_calibration_lookup(wind_speed, lookup: pd.DataFrame) -> np.ndarray:
+    """LDAPS 풍속을 보정 룩업으로 SCADA-등가 풍속으로 치환한다."""
+    ws = np.asarray(wind_speed, dtype=float)
+    result = np.full(len(ws), np.nan, dtype=float)
+    valid = np.isfinite(ws)
+    result[valid] = np.interp(
+        ws[valid],
+        lookup["ldaps_center"].to_numpy(),
+        lookup["median"].to_numpy(),
+    )
+    return result
 
-    return lookup[["ws_center", "median"]]
 
-# 룩업 테이블 + 예보 풍속(LDAPS 등)으로 그룹 전체 발전량 추정 (apply 단계, train/test 공통)
-def apply_power_curve_lookup(wind_speed, lookup, n_turbines):
-    per_turbine_pred = np.interp(wind_speed, lookup["ws_center"], lookup["median"])
-    return per_turbine_pred * n_turbines
+def fit_group_shear_calibration(
+    group: int,
+    meta: dict,
+    ldaps_train_grid: pd.DataFrame,
+    grid_id: int,
+    scada_vestas_fit: pd.DataFrame,
+    scada_unison_fit: pd.DataFrame,
+    cutoff: pd.Timestamp,
+) -> pd.DataFrame:
+    """cutoff 이전 구간에서 그룹 대표 격자의 ws117과 SCADA 실측(시간평균)을 매칭해
+    shear 보정 룩업을 학습한다. (진단 스크립트와 동일한 시간 정합 방식)"""
+    ldaps_g = ldaps_train_grid[
+        (ldaps_train_grid["grid_id"] == grid_id)
+        & (ldaps_train_grid["forecast_kst_dtm"] < cutoff)
+    ][["forecast_kst_dtm", "ws117_power_ldaps"]]
 
-# 풍속bin×풍향bin -> 터빈 1기당 발전량 표준편차 룩업 테이블 생성 (train SCADA 전용, fit 단계)
-# fit_power_curve_lookup과 동일하게 그룹 내 터빈들을 풀링해서 "터빈 1기 기준" 값으로 만듦
-def fit_variability_lookup(scada_train, turbines, power_suffix="_power_kw10m", ws_suffix="_ws", wd_suffix="_wd",
-                            ws_bin_width=0.5, wd_bin_width=30, min_count=30):
-    pooled = pd.concat([
-        pd.DataFrame({
-            "power": scada_train[f"{wtg}{power_suffix}"],
-            "ws": scada_train[f"{wtg}{ws_suffix}"],
-            "wd": scada_train[f"{wtg}{wd_suffix}"] % 360,
-        })
-        for wtg in turbines
-    ], ignore_index=True).dropna()
+    scada_source = scada_vestas_fit if meta["maker"] == "vestas" else scada_unison_fit
+    turbines = _turbine_names(meta["maker"], meta["turbines"])
+    ws_cols = [f"{t}_ws" for t in turbines]
 
+    scada_hourly = scada_source[["kst_dtm"] + ws_cols].copy()
+    scada_hourly["forecast_kst_dtm"] = scada_hourly["kst_dtm"].dt.floor("h")
+    scada_hourly["scada_ws_mean"] = scada_hourly[ws_cols].mean(axis=1)
+    scada_hourly = scada_hourly.groupby("forecast_kst_dtm")["scada_ws_mean"].mean().reset_index()
+
+    merged = ldaps_g.merge(scada_hourly, on="forecast_kst_dtm", how="inner").dropna()
+    return fit_shear_calibration_lookup(merged["ws117_power_ldaps"], merged["scada_ws_mean"])
+
+
+def apply_power_curve_lookup(
+    wind_speed,
+    lookup: pd.DataFrame,
+    n_turbines: int,
+) -> np.ndarray:
+    """예보 풍속으로 경험적 파워커브를 조회한다."""
+    ws = np.asarray(wind_speed, dtype=float)
+    result = np.full(len(ws), np.nan, dtype=float)
+    valid = np.isfinite(ws)
+    result[valid] = np.interp(
+        ws[valid],
+        lookup["ws_center"].to_numpy(),
+        lookup["median"].to_numpy(),
+    ) * n_turbines
+    return result
+
+
+def fit_variability_lookup(
+    scada_fit: pd.DataFrame,
+    turbines: list[str],
+    power_suffix: str = "_power_kw10m",
+    ws_suffix: str = "_ws",
+    wd_suffix: str = "_wd",
+    ws_bin_width: float = 0.5,
+    wd_bin_width: int = 30,
+    min_count: int = 30,
+) -> pd.DataFrame:
+    """cutoff 이전 SCADA로 풍속·풍향 조건별 발전량 변동성을 학습한다."""
+    pooled_parts = []
+    for turbine in turbines:
+        pooled_parts.append(
+            pd.DataFrame({
+                "power": scada_fit[f"{turbine}{power_suffix}"],
+                "ws": scada_fit[f"{turbine}{ws_suffix}"],
+                "wd": scada_fit[f"{turbine}{wd_suffix}"] % 360,
+            })
+        )
+
+    pooled = pd.concat(pooled_parts, ignore_index=True).dropna()
+    pooled["power"] = pooled["power"].clip(lower=0)
     pooled["ws_bin"] = np.floor(pooled["ws"] / ws_bin_width)
     pooled["wd_bin"] = np.floor(pooled["wd"] / wd_bin_width)
-    lookup = pooled.groupby(["ws_bin", "wd_bin"])["power"].agg(["std", "count"]).reset_index()
+
+    lookup = (
+        pooled.groupby(["ws_bin", "wd_bin"])["power"]
+        .agg(std="std", count="count")
+        .reset_index()
+    )
     lookup.loc[lookup["count"] < min_count, "std"] = np.nan
-    return lookup[["ws_bin", "wd_bin", "std"]]
+    if lookup["std"].notna().sum() == 0:
+        raise ValueError("유효한 SCADA 변동성 룩업을 만들 수 없습니다.")
+    return lookup[["ws_bin", "wd_bin", "std", "count"]]
 
-# 룩업 테이블 + 예보 풍속·풍향(LDAPS)으로 그룹 전체 변동성 추정 (apply 단계, train/test 공통)
-# 해당 (풍속bin, 풍향bin) 표본이 부족해 std가 NaN이면, 풍향은 무시하고 풍속bin 평균으로 대체(fallback)
-def apply_variability_lookup(wind_speed, wind_direction, lookup, ws_bin_width=0.5, wd_bin_width=30):
+
+def apply_variability_lookup(
+    wind_speed,
+    wind_direction,
+    lookup: pd.DataFrame,
+    ws_bin_width: float = 0.5,
+    wd_bin_width: int = 30,
+) -> np.ndarray:
+    """행 순서를 보존하면서 조건별 변동성 값을 조회한다."""
+    ws = np.asarray(wind_speed, dtype=float)
+    wd = np.asarray(wind_direction, dtype=float)
+
     query = pd.DataFrame({
-        "ws_bin": np.floor(np.asarray(wind_speed) / ws_bin_width),
-        "wd_bin": np.floor((np.asarray(wind_direction) % 360) / wd_bin_width),
+        "_row_id": np.arange(len(ws)),
+        "ws_bin": np.floor(ws / ws_bin_width),
+        "wd_bin": np.floor((wd % 360) / wd_bin_width),
     })
-    merged = query.merge(lookup, on=["ws_bin", "wd_bin"], how="left")
-    fallback = lookup.groupby("ws_bin")["std"].mean().rename("std_fallback")
-    merged = merged.merge(fallback, on="ws_bin", how="left")
-    return merged["std"].fillna(merged["std_fallback"]).values
 
-
-########## tabular 데이터 생성 ##########
-def get_tabular_data():
-    """학습 및 테스트용 Tabular 데이터셋 병합 및 반환"""
-    # 1. 데이터 로드
-    train_labels = pd.read_csv(RAW_DIR / "train" / "train_labels.csv", encoding="utf-8-sig")
-    sample_sub = pd.read_csv(RAW_DIR / "sample_submission.csv", encoding="utf-8-sig")
-    
-    ldaps_train = pd.read_csv(RAW_DIR / "train" / "ldaps_train.csv", encoding="utf-8-sig")
-    gfs_train = pd.read_csv(RAW_DIR / "train" / "gfs_train.csv", encoding="utf-8-sig")
-    ldaps_test = pd.read_csv(RAW_DIR / "test" / "ldaps_test.csv", encoding="utf-8-sig")
-    gfs_test = pd.read_csv(RAW_DIR / "test" / "gfs_test.csv", encoding="utf-8-sig")
-    scada_vestas_train = pd.read_csv(RAW_DIR / "train" / "scada_vestas_train.csv", encoding="utf-8-sig")
-    scada_unison_train = pd.read_csv(RAW_DIR / "train" / "scada_unison_train.csv", encoding="utf-8-sig")
-
-    train_labels["kst_dtm"] = pd.to_datetime(train_labels["kst_dtm"])
-    sample_sub["forecast_kst_dtm"] = pd.to_datetime(sample_sub["forecast_kst_dtm"])
-    scada_vestas_train["kst_dtm"] = pd.to_datetime(scada_vestas_train["kst_dtm"])
-    scada_unison_train["kst_dtm"] = pd.to_datetime(scada_unison_train["kst_dtm"])
-
-    ldaps_train["forecast_kst_dtm"] = pd.to_datetime(ldaps_train["forecast_kst_dtm"])   # ← 추가
-    ldaps_test["forecast_kst_dtm"] = pd.to_datetime(ldaps_test["forecast_kst_dtm"]) 
-    gfs_train["forecast_kst_dtm"] = pd.to_datetime(gfs_train["forecast_kst_dtm"])
-    gfs_test["forecast_kst_dtm"] = pd.to_datetime(gfs_test["forecast_kst_dtm"])
-
-    # 2. feature engineering 적용
-    ###### GFS ######
-    gfs_train_grid = gfs_train.pipe(add_ws117_power_gfs)
-    gfs_test_grid = gfs_test.pipe(add_ws117_power_gfs)
-
-    # GFS Train
-    gfs_train = (
-        gfs_train
-        # .pipe(add_wd_cos)
-        # .pipe(add_wd_sin)
-        .pipe(add_turbulence_intensity)
-        .pipe(add_dayofyear_cos)
-        .pipe(add_dayofyear_sin)
-        # .pipe(add_hour_cos)
-        # .pipe(add_hour_sin)
-        # .pipe(add_ws117_channel_cross)
-        # .pipe(add_ws117_channel_along)
-    )
-    gfs_train_ws117 = (
-            add_ws117_gfs_grid(gfs_train_grid)
-            .pipe(add_ws117_gfs_spatial_mean)
-            .pipe(add_ws117_cube_gfs)
-            .pipe(add_ws117_diff_1h_gfs)
-            .pipe(add_ws117_lag_24h_gfs)
-            .pipe(add_ws117_roll_mean_6h_gfs)
-            .pipe(add_ws117_roll_std_6h_gfs)
-    )
-    
-
-    # GFS Test
-    gfs_test = (
-        gfs_test
-        # .pipe(add_wd_cos)
-        # .pipe(add_wd_sin)
-        .pipe(add_turbulence_intensity)
-        .pipe(add_dayofyear_cos)
-        .pipe(add_dayofyear_sin)
-        # .pipe(add_hour_cos)
-        # .pipe(add_hour_sin)
-        # .pipe(add_ws117_channel_cross)
-        # .pipe(add_ws117_channel_along)
-    )
-    gfs_test_ws117 = (
-        add_ws117_gfs_grid(gfs_test_grid)
-        .pipe(add_ws117_gfs_spatial_mean)
-        .pipe(add_ws117_cube_gfs)
-        .pipe(add_ws117_diff_1h_gfs)
-        .pipe(add_ws117_lag_24h_gfs)
-        .pipe(add_ws117_roll_mean_6h_gfs)
-        .pipe(add_ws117_roll_std_6h_gfs)
+    merged = query.merge(
+        lookup[["ws_bin", "wd_bin", "std"]],
+        on=["ws_bin", "wd_bin"],
+        how="left",
+        sort=False,
+        validate="many_to_one",
     )
 
-    gfs_train_alpha = add_alpha_shear_gfs(gfs_train)
-    gfs_train_density = add_air_density_gfs(gfs_train)
-    gfs_train_prmsl = add_prmsl_range_gfs(gfs_train)
-    gfs_test_alpha = add_alpha_shear_gfs(gfs_test)
-    gfs_test_density = add_air_density_gfs(gfs_test)
-    gfs_test_prmsl = add_prmsl_range_gfs(gfs_test)
-
-    gfs_train_hourly = (
-        gfs_train_ws117
-        .merge(gfs_train_alpha, on="forecast_kst_dtm", how="left")
-        .merge(gfs_train_density, on="forecast_kst_dtm", how="left")
-        .merge(gfs_train_prmsl, on="forecast_kst_dtm", how="left")
-        .pipe(add_wind_energy_flux_gfs)
+    speed_fallback = (
+        lookup.groupby("ws_bin")["std"]
+        .median()
+        .rename("std_speed_fallback")
     )
-    gfs_test_hourly = (
-        gfs_test_ws117
-        .merge(gfs_test_alpha, on="forecast_kst_dtm", how="left")
-        .merge(gfs_test_density, on="forecast_kst_dtm", how="left")
-        .merge(gfs_test_prmsl, on="forecast_kst_dtm", how="left")
-        .pipe(add_wind_energy_flux_gfs)
+    merged = merged.merge(
+        speed_fallback,
+        on="ws_bin",
+        how="left",
+        sort=False,
+        validate="many_to_one",
     )
 
-    ###### LDAPS ######
-    ldaps_train_grid = ldaps_train.pipe(add_ws117_power_ldaps).pipe(add_wd117_ldaps)
-    ldaps_test_grid = ldaps_test.pipe(add_ws117_power_ldaps).pipe(add_wd117_ldaps)
+    global_fallback = float(lookup["std"].median())
+    merged["result"] = (
+        merged["std"]
+        .fillna(merged["std_speed_fallback"])
+        .fillna(global_fallback)
+    )
+    return merged.sort_values("_row_id")["result"].to_numpy()
 
-    # LDAPS Train
-    ldaps_train_ws117 = (
-        add_ws117_ldaps_grid(ldaps_train_grid)
-        .merge(add_wd117_ldaps_grid(ldaps_train_grid), on="forecast_kst_dtm", how="left")
-        .pipe(add_ws117_ldaps_spatial_mean)
-        .pipe(add_ws117_cube_ldaps)
-        .pipe(add_ws117_diff_1h_ldaps)
-        .pipe(add_ws117_lag_24h_ldaps)
-        .pipe(add_ws117_roll_mean_6h_ldaps)
-        .pipe(add_ws117_roll_std_6h_ldaps)
+
+def _apply_scada_proxy_features(
+    frame: pd.DataFrame,
+    group_grids: dict[int, int],
+    power_lookups: dict[int, pd.DataFrame],
+    variability_lookups: dict[int, pd.DataFrame],
+    shear_calibration_lookups: dict[int, pd.DataFrame],  # [신규]
+) -> pd.DataFrame:
+    out = frame.copy()
+
+    for group, meta in GROUP_META.items():
+        grid_id = group_grids[group]
+        ws_col = f"ws117_ldaps_grid_{grid_id}"
+        wd_col = f"wd117_ldaps_grid_{grid_id}"
+
+        if ws_col not in out.columns or wd_col not in out.columns:
+            raise KeyError(
+                f"그룹 {group} 대표 grid={grid_id} 피처가 없습니다: {ws_col}, {wd_col}"
+            )
+
+        # [신규] 선형 보정 대신 비선형 룩업 보정 적용
+        calibrated_ws = apply_shear_calibration_lookup(out[ws_col], shear_calibration_lookups[group])
+        out[f"ws117_calibrated_group{group}"] = calibrated_ws  # [신규] 모델이 직접 쓸 수 있는 feature로도 보존
+
+        out[meta["power_feature"]] = apply_power_curve_lookup(
+            calibrated_ws,
+            power_lookups[group],
+            n_turbines=meta["n_turbines"],
+        )
+        out[meta["variability_feature"]] = apply_variability_lookup(
+            calibrated_ws,
+            out[wd_col],
+            variability_lookups[group],
+        )
+
+    out["vestas_power_curve_pred"] = (
+        out["vestas_power_curve_pred_group1"]
+        + out["vestas_power_curve_pred_group2"]
+    )
+    return out
+
+
+# -----------------------------------------------------------------------------
+# 최종 데이터 생성
+# -----------------------------------------------------------------------------
+def _build_audit(
+    mode: str,
+    cutoff: pd.Timestamp,
+    validation_start: pd.Timestamp | None,
+    train_labels_all: pd.DataFrame,
+    labels_used: pd.DataFrame,
+    scada_vestas_all: pd.DataFrame,
+    scada_vestas_fit: pd.DataFrame,
+    scada_unison_all: pd.DataFrame,
+    scada_unison_fit: pd.DataFrame,
+) -> dict[str, object]:
+    return {
+        "mode": mode,
+        "cutoff": str(cutoff),
+        "validation_start": None if validation_start is None else str(validation_start),
+        "label_rows_total": int(len(train_labels_all)),
+        "label_rows_returned": int(len(labels_used)),
+        "latest_label_returned": str(labels_used["kst_dtm"].max()),
+        "vestas_rows_total": int(len(scada_vestas_all)),
+        "vestas_rows_fit": int(len(scada_vestas_fit)),
+        "latest_vestas_used": str(scada_vestas_fit["kst_dtm"].max()),
+        "unison_rows_total": int(len(scada_unison_all)),
+        "unison_rows_fit": int(len(scada_unison_fit)),
+        "latest_unison_used": str(scada_unison_fit["kst_dtm"].max()),
+    }
+
+
+def get_tabular_data(
+    mode: str = "final",
+    validation_start: str | pd.Timestamp | None = None,
+    prediction_reference_offset_hours: int = PREDICTION_REFERENCE_OFFSET_HOURS,
+):
+    """
+    누수 방지형 학습·테스트 Tabular 데이터 생성.
+
+    Parameters
+    ----------
+    mode:
+        "final": 실제 2025 TEST 제출용. 첫 TEST 예보 기준시점 이전의
+                 라벨과 SCADA만 사용한다.
+        "validation": 시간 검증용. 첫 검증 예보 기준시점 이전 SCADA로만
+                      룩업을 fit하고 전체 TRAIN을 반환한다.
+    validation_start:
+        mode="validation"일 때 첫 검증 대상 시각.
+        실제 관측자료 cutoff는 이 target의 data_available_kst_dtm에서 계산한다.
+    prediction_reference_offset_hours:
+        기본 0. 대회가 공식적으로 기준시점을 data_available+1h로 확정했을 때만 1.
+
+    Returns
+    -------
+    train_df, X_train, test_df, X_test, sample_sub
+
+    검증 모드 사용법
+    ---------------
+    fit_mask = train_df["_fit_eligible"] & train_df[target].notna()
+    valid_mask = train_df["_is_validation"] & train_df[target].notna()
+    모델은 X_train.loc[fit_mask]로만 fit하고 X_train.loc[valid_mask]로 평가한다.
+    """
+    train_labels_all = pd.read_csv(
+        RAW_DIR / "train" / "train_labels.csv",
+        encoding="utf-8-sig",
+    )
+    sample_sub = pd.read_csv(
+        RAW_DIR / "sample_submission.csv",
+        encoding="utf-8-sig",
+    )
+    ldaps_train = pd.read_csv(
+        RAW_DIR / "train" / "ldaps_train.csv",
+        encoding="utf-8-sig",
+    )
+    gfs_train = pd.read_csv(
+        RAW_DIR / "train" / "gfs_train.csv",
+        encoding="utf-8-sig",
+    )
+    ldaps_test = pd.read_csv(
+        RAW_DIR / "test" / "ldaps_test.csv",
+        encoding="utf-8-sig",
+    )
+    gfs_test = pd.read_csv(
+        RAW_DIR / "test" / "gfs_test.csv",
+        encoding="utf-8-sig",
+    )
+    scada_vestas_all = pd.read_csv(
+        RAW_DIR / "train" / "scada_vestas_train.csv",
+        encoding="utf-8-sig",
+    )
+    scada_unison_all = pd.read_csv(
+        RAW_DIR / "train" / "scada_unison_train.csv",
+        encoding="utf-8-sig",
     )
 
-    ldaps_test_ws117 = (
-        add_ws117_ldaps_grid(ldaps_test_grid)
-        .merge(add_wd117_ldaps_grid(ldaps_test_grid), on="forecast_kst_dtm", how="left")
-        .pipe(add_ws117_ldaps_spatial_mean)
-        .pipe(add_ws117_cube_ldaps)
-        .pipe(add_ws117_diff_1h_ldaps)
-        .pipe(add_ws117_lag_24h_ldaps)
-        .pipe(add_ws117_roll_mean_6h_ldaps)
-        .pipe(add_ws117_roll_std_6h_ldaps)
+    _parse_times(
+        train_labels_all,
+        sample_sub,
+        ldaps_train,
+        gfs_train,
+        ldaps_test,
+        gfs_test,
+        scada_vestas_all,
+        scada_unison_all,
     )
 
-    # pipe 불가능 항목들
-    ldaps_train_alpha = add_alpha_shear_ldaps(ldaps_train)
-    ldaps_train_density = add_air_density_ldaps(ldaps_train)
-    ldaps_train_prmsl = add_prmsl_range_ldaps(ldaps_train)
-    ldaps_test_alpha = add_alpha_shear_ldaps(ldaps_test)
-    ldaps_test_density = add_air_density_ldaps(ldaps_test)
-    ldaps_test_prmsl = add_prmsl_range_ldaps(ldaps_test)
+    for frame, name in (
+        (ldaps_train, "LDAPS TRAIN"),
+        (ldaps_test, "LDAPS TEST"),
+        (gfs_train, "GFS TRAIN"),
+        (gfs_test, "GFS TEST"),
+    ):
+        _assert_one_issue_per_target(frame, name)
 
-    ldaps_train_hourly = (
-        ldaps_train_ws117
-        .merge(ldaps_train_alpha, on="forecast_kst_dtm", how="left")
-        .merge(ldaps_train_density, on="forecast_kst_dtm", how="left")
-        .merge(ldaps_train_prmsl, on="forecast_kst_dtm", how="left")
-        .pipe(add_wind_energy_flux_ldaps)
-    )
-    ldaps_test_hourly = (
-        ldaps_test_ws117
-        .merge(ldaps_test_alpha, on="forecast_kst_dtm", how="left")
-        .merge(ldaps_test_density, on="forecast_kst_dtm", how="left")
-        .merge(ldaps_test_prmsl, on="forecast_kst_dtm", how="left")
-        .pipe(add_wind_energy_flux_ldaps)
+    cutoff, actual_validation_start = _resolve_cutoff(
+        mode=mode,
+        validation_start=validation_start,
+        ldaps_train=ldaps_train,
+        gfs_train=gfs_train,
+        ldaps_test=ldaps_test,
+        gfs_test=gfs_test,
+        prediction_reference_offset_hours=prediction_reference_offset_hours,
     )
 
-    ###### SCADA -> 그룹별 발전량 룩업 (fit/apply) ######
-    # TODO: 지금은 그룹 내 터빈 좌표를 "단순 평균"해서 중심좌표로 쓰고 있음.
-    #       나중엔 이 그룹의 발전량에 가장 영향을 주는 좌표로 개선하면 좋겠음.
+    # 실제 발전량/운영자료로 만드는 모든 통계는 cutoff 이전만 허용한다.
+    scada_vestas_fit = _filter_observed_before(scada_vestas_all, cutoff)
+    scada_unison_fit = _filter_observed_before(scada_unison_all, cutoff)
+
+    if mode == "final":
+        labels_used = _filter_observed_before(train_labels_all, cutoff)
+    else:
+        labels_used = train_labels_all.copy()
+
+    # TRAIN/TEST는 따로 결측 처리한다. 동일 예보 발행 묶음 안에서만 보간한다.
+    ldaps_train = impute_ldaps_within_issue_cycle(ldaps_train)
+    ldaps_test = impute_ldaps_within_issue_cycle(ldaps_test)
+
+    ldaps_train_grid = add_ldaps_grid_features(ldaps_train)
+    ldaps_test_grid = add_ldaps_grid_features(ldaps_test)
+    ldaps_train_hourly, ldaps_test_hourly = build_ldaps_hourly_pair(
+        ldaps_train_grid,
+        ldaps_test_grid,
+    )
+
+    gfs_train_hourly = aggregate_weather(
+        add_gfs_features(gfs_train),
+        "gfs",
+    )
+    gfs_test_hourly = aggregate_weather(
+        add_gfs_features(gfs_test),
+        "gfs",
+    )
+
+    train_weather = ldaps_train_hourly.merge(
+        gfs_train_hourly,
+        on="forecast_kst_dtm",
+        how="inner",
+        validate="one_to_one",
+    )
+    test_weather = ldaps_test_hourly.merge(
+        gfs_test_hourly,
+        on="forecast_kst_dtm",
+        how="inner",
+        validate="one_to_one",
+    )
+
+    if len(train_weather) != train_labels_all["kst_dtm"].nunique():
+        raise ValueError(
+            "TRAIN 날씨 병합 행 수와 전체 라벨 시간 수가 다릅니다: "
+            f"{len(train_weather)} != {train_labels_all['kst_dtm'].nunique()}"
+        )
+    if len(test_weather) != sample_sub["forecast_kst_dtm"].nunique():
+        raise ValueError(
+            "TEST 날씨 병합 행 수와 제출 시간 수가 다릅니다: "
+            f"{len(test_weather)} != {sample_sub['forecast_kst_dtm'].nunique()}"
+        )
+
     group_centers = get_kpx_group_centers(RAW_DIR / "info.xlsx")
-    grid_g1 = nearest_ldaps_grid_id(*group_centers.loc[1], ldaps_train)  # VESTAS group1
-    grid_g2 = nearest_ldaps_grid_id(*group_centers.loc[2], ldaps_train)  # VESTAS group2
-    grid_g3 = nearest_ldaps_grid_id(*group_centers.loc[3], ldaps_train)  # UNISON group3
+    diagnose_grid_correlation(ldaps_train_grid, train_labels_all, cutoff)
+    group_grids = {
+        group: select_group_grid_id(
+            group=group,
+            center_lat=group_centers.loc[group, "lat"],
+            center_lon=group_centers.loc[group, "lon"],
+            ldaps_train_grid=ldaps_train_grid,
+            train_labels_all=train_labels_all,
+            target_col=f"kpx_group_{group}",
+            cutoff=cutoff,
+            method=GRID_SELECTION_METHOD,
+            manual_selection=GRID_MANUAL_SELECTION,
+        )
+        for group in GROUP_META
+    }
+    print(f"그룹별 대표 격자 선택({GRID_SELECTION_METHOD}): {group_grids}")
 
-    gfs_g1 = nearest_gfs_grid_id(*group_centers.loc[1], gfs_train)  # VESTAS group1
-    gfs_g2 = nearest_gfs_grid_id(*group_centers.loc[2], gfs_train)  # VESTAS group2
-    gfs_g3 = nearest_gfs_grid_id(*group_centers.loc[3], gfs_train)  # UNISON group3
+    power_lookups: dict[int, pd.DataFrame] = {}
+    variability_lookups: dict[int, pd.DataFrame] = {}
+    shear_calibration_lookups: dict[int, pd.DataFrame] = {}  # [신규]
 
-    # fit: train SCADA로 그룹별 풍속->발전량 룩업 학습
-    lookup_vestas_all = fit_power_curve_lookup(scada_vestas_train, [f"vestas_wtg{i:02d}" for i in range(1, 13)])
-    lookup_vestas_g1 = fit_power_curve_lookup(scada_vestas_train, [f"vestas_wtg{i:02d}" for i in range(1, 7)])
-    lookup_vestas_g2 = fit_power_curve_lookup(scada_vestas_train, [f"vestas_wtg{i:02d}" for i in range(7, 13)])
-    lookup_unison = fit_power_curve_lookup(scada_unison_train, [f"unison_wtg{i:02d}" for i in range(1, 6)])
+    for group, meta in GROUP_META.items():
+        scada_source = (
+            scada_vestas_fit
+            if meta["maker"] == "vestas"
+            else scada_unison_fit
+        )
+        turbines = _turbine_names(meta["maker"], meta["turbines"])
+        power_lookups[group] = fit_power_curve_lookup(
+            scada_source,
+            turbines,
+        )
+        variability_lookups[group] = fit_variability_lookup(
+            scada_source,
+            turbines,
+        )
+        shear_calibration_lookups[group] = fit_group_shear_calibration(  # [신규]
+            group, meta, ldaps_train_grid, group_grids[group],
+            scada_vestas_fit, scada_unison_fit, cutoff,
+        )
 
-    # 발전량 변동성에 fit/apply 방식 적용
-    lookup_var_vestas_g1 = fit_variability_lookup(scada_vestas_train, [f"vestas_wtg{i:02d}" for i in range(1, 7)])
-    lookup_var_vestas_g2 = fit_variability_lookup(scada_vestas_train, [f"vestas_wtg{i:02d}" for i in range(7, 13)])
-    lookup_var_unison = fit_variability_lookup(scada_unison_train, [f"unison_wtg{i:02d}" for i in range(1, 6)])
-
-    lookup_gfs_vestas_g1 = fit_power_curve_lookup_gfs(
-        scada_vestas_train, [f"vestas_wtg{i:02d}" for i in range(1, 7)],
-        v_in=3, v_rated=12.0, v_out=22.5, capacity=21600
+    train_base = labels_used.rename(columns={"kst_dtm": "forecast_kst_dtm"})
+    train_df = train_base.merge(
+        train_weather,
+        on="forecast_kst_dtm",
+        how="left",
+        validate="one_to_one",
     )
-    lookup_gfs_vestas_g2 = fit_power_curve_lookup_gfs(
-        scada_vestas_train, [f"vestas_wtg{i:02d}" for i in range(7, 13)],
-        v_in=3, v_rated=12.0, v_out=22.5, capacity=21600
-    )
-    lookup_gfs_unison = fit_power_curve_lookup_gfs(
-        scada_unison_train, [f"unison_wtg{i:02d}" for i in range(1, 6)],
-        v_in=3, v_rated=12.5, v_out=22.0, capacity=21000
-    )
-
-    # 터빈 효율 (그룹당 상수 1개, train SCADA 전체로 학습 -> 모든 행에 동일하게 broadcast, 확인 완료)
-    vestas_eff1 = add_vestas_turbine_efficiency_group1(scada_vestas_train)["vestas_turbine_efficiency_group1"].iloc[0]
-    vestas_eff2 = add_vestas_turbine_efficiency_group2(scada_vestas_train)["vestas_turbine_efficiency_group2"].iloc[0]
-    unison_eff = add_unison_turbine_efficiency(scada_unison_train)["unison_turbine_efficiency"].iloc[0]
-
-    
-    # 날씨 데이터 병합 (기존 로직 + LDAPS 파생변수 merge)
-    train_weather = (
-        aggregate_weather(ldaps_train, "ldaps")
-        .merge(aggregate_weather(gfs_train, "gfs"), on="forecast_kst_dtm", how="inner")
-        .merge(ldaps_train_hourly, on="forecast_kst_dtm", how="left")
-        .merge(gfs_train_hourly, on="forecast_kst_dtm", how="left")
-    )
-    test_weather = (
-        aggregate_weather(ldaps_test, "ldaps")
-        .merge(aggregate_weather(gfs_test, "gfs"), on="forecast_kst_dtm", how="inner")
-        .merge(ldaps_test_hourly, on="forecast_kst_dtm", how="left")
-        .merge(gfs_test_hourly, on="forecast_kst_dtm", how="left")
-    )
-
-    train_base = train_labels.rename(columns={"kst_dtm": "forecast_kst_dtm"})
-    train_df = train_base.merge(train_weather, on="forecast_kst_dtm", how="left")
-    train_df["vestas_turbine_efficiency_group1"] = vestas_eff1
-    train_df["vestas_turbine_efficiency_group2"] = vestas_eff2
-    train_df["unison_turbine_efficiency"] = unison_eff
-
-    # apply: 룩업 + LDAPS 격자 풍속으로 train/test 둘 다 채움
-    train_df["vestas_power_curve_pred"] = apply_power_curve_lookup(
-        train_df[f"ws117_ldaps_grid_{grid_g1}"], lookup_vestas_all, n_turbines=12
-    )
-    train_df["vestas_power_curve_pred_group1"] = apply_power_curve_lookup(
-        train_df[f"ws117_ldaps_grid_{grid_g1}"], lookup_vestas_g1, n_turbines=6
-    )
-    train_df["vestas_power_curve_pred_group2"] = apply_power_curve_lookup(
-        train_df[f"ws117_ldaps_grid_{grid_g2}"], lookup_vestas_g2, n_turbines=6
-    )
-    train_df["unison_power_curve_pred"] = apply_power_curve_lookup(
-        train_df[f"ws117_ldaps_grid_{grid_g3}"], lookup_unison, n_turbines=5
-    )
-    train_df["vestas_power_variability_group1"] = apply_variability_lookup(
-        train_df[f"ws117_ldaps_grid_{grid_g1}"], train_df[f"wd117_ldaps_grid_{grid_g1}"], lookup_var_vestas_g1
-    )
-    train_df["vestas_power_variability_group2"] = apply_variability_lookup(
-        train_df[f"ws117_ldaps_grid_{grid_g2}"], train_df[f"wd117_ldaps_grid_{grid_g2}"], lookup_var_vestas_g2
-    )
-    train_df["unison_power_variability"] = apply_variability_lookup(
-        train_df[f"ws117_ldaps_grid_{grid_g3}"], train_df[f"wd117_ldaps_grid_{grid_g3}"], lookup_var_unison
-    )
-    train_df = add_power_curve_pred_group1_ldaps(train_df, grid_g1)
-    train_df = add_power_curve_pred_group2_ldaps(train_df, grid_g2)
-    train_df = add_power_curve_pred_group3_ldaps(train_df, grid_g3)
-    train_df = add_power_curve_pred_group1_gfs(train_df, gfs_g1)
-    train_df = add_power_curve_pred_group2_gfs(train_df, gfs_g2)
-    train_df = add_power_curve_pred_group3_gfs(train_df, gfs_g3)
-    train_df["power_curve_pred_lookup_group1_gfs"] = apply_power_curve_lookup(
-        train_df[f"ws117_gfs_grid_{gfs_g1}"], lookup_gfs_vestas_g1, n_turbines=6
-    )
-    train_df["power_curve_pred_lookup_group2_gfs"] = apply_power_curve_lookup(
-        train_df[f"ws117_gfs_grid_{gfs_g2}"], lookup_gfs_vestas_g2, n_turbines=6
-    )
-    train_df["power_curve_pred_lookup_group3_gfs"] = apply_power_curve_lookup(
-        train_df[f"ws117_gfs_grid_{gfs_g3}"], lookup_gfs_unison, n_turbines=5
-    )
-
     test_df = sample_sub[["forecast_id", "forecast_kst_dtm"]].merge(
-        test_weather, on="forecast_kst_dtm", how="left"
-    )
-    test_df["vestas_power_curve_pred"] = apply_power_curve_lookup(
-        test_df[f"ws117_ldaps_grid_{grid_g1}"], lookup_vestas_all, n_turbines=12
-    )
-    test_df["vestas_power_curve_pred_group1"] = apply_power_curve_lookup(
-        test_df[f"ws117_ldaps_grid_{grid_g1}"], lookup_vestas_g1, n_turbines=6
-    )
-    test_df["vestas_power_curve_pred_group2"] = apply_power_curve_lookup(
-        test_df[f"ws117_ldaps_grid_{grid_g2}"], lookup_vestas_g2, n_turbines=6
-    )
-    test_df["unison_power_curve_pred"] = apply_power_curve_lookup(
-        test_df[f"ws117_ldaps_grid_{grid_g3}"], lookup_unison, n_turbines=5
-    )
-    test_df["vestas_power_variability_group1"] = apply_variability_lookup(
-        test_df[f"ws117_ldaps_grid_{grid_g1}"], test_df[f"wd117_ldaps_grid_{grid_g1}"], lookup_var_vestas_g1
-    )
-    test_df["vestas_power_variability_group2"] = apply_variability_lookup(
-        test_df[f"ws117_ldaps_grid_{grid_g2}"], test_df[f"wd117_ldaps_grid_{grid_g2}"], lookup_var_vestas_g2
-    )
-    test_df["unison_power_variability"] = apply_variability_lookup(
-        test_df[f"ws117_ldaps_grid_{grid_g3}"], test_df[f"wd117_ldaps_grid_{grid_g3}"], lookup_var_unison
-    )
-    test_df["vestas_turbine_efficiency_group1"] = vestas_eff1
-    test_df["vestas_turbine_efficiency_group2"] = vestas_eff2
-    test_df["unison_turbine_efficiency"] = unison_eff
-    test_df = add_power_curve_pred_group1_ldaps(test_df, grid_g1)
-    test_df = add_power_curve_pred_group2_ldaps(test_df, grid_g2)
-    test_df = add_power_curve_pred_group3_ldaps(test_df, grid_g3)
-    test_df = add_power_curve_pred_group1_gfs(test_df, gfs_g1)
-    test_df = add_power_curve_pred_group2_gfs(test_df, gfs_g2)
-    test_df = add_power_curve_pred_group3_gfs(test_df, gfs_g3)
-    test_df["power_curve_pred_lookup_group1_gfs"] = apply_power_curve_lookup(
-        test_df[f"ws117_gfs_grid_{gfs_g1}"], lookup_gfs_vestas_g1, n_turbines=6
-    )
-    test_df["power_curve_pred_lookup_group2_gfs"] = apply_power_curve_lookup(
-        test_df[f"ws117_gfs_grid_{gfs_g2}"], lookup_gfs_vestas_g2, n_turbines=6
-    )
-    test_df["power_curve_pred_lookup_group3_gfs"] = apply_power_curve_lookup(
-        test_df[f"ws117_gfs_grid_{gfs_g3}"], lookup_gfs_unison, n_turbines=5
+        test_weather,
+        on="forecast_kst_dtm",
+        how="left",
+        validate="one_to_one",
     )
 
-    X_train = pd.concat([
-        calendar_features(train_df["forecast_kst_dtm"]),
-        train_df.drop(columns=["forecast_kst_dtm", *TARGET_COLS])
-    ], axis=1)
+    train_df = _apply_scada_proxy_features(
+        train_df,
+        group_grids,
+        power_lookups,
+        variability_lookups,
+        shear_calibration_lookups,
+    )
+    test_df = _apply_scada_proxy_features(
+        test_df,
+        group_grids,
+        power_lookups,
+        variability_lookups,
+        shear_calibration_lookups, 
+    )
 
-    X_test = pd.concat([
-        calendar_features(test_df["forecast_kst_dtm"]),
-        test_df.drop(columns=["forecast_id", "forecast_kst_dtm"])
-    ], axis=1)
+    # 검증 때 반드시 사용할 명시적 마스크. purge gap은 두 마스크 모두 False다.
+    train_df["_fit_eligible"] = train_df["forecast_kst_dtm"] < cutoff
+    if mode == "validation":
+        train_df["_is_validation"] = (
+            train_df["forecast_kst_dtm"] >= actual_validation_start
+        )
+    else:
+        train_df["_is_validation"] = False
+
+    non_feature_cols = {
+        "forecast_kst_dtm",
+        "ldaps_data_available_kst_dtm",
+        "gfs_data_available_kst_dtm",
+        "_fit_eligible",
+        "_is_validation",
+        *TARGET_COLS,
+    }
+    train_numeric = train_df.drop(
+        columns=[col for col in non_feature_cols if col in train_df.columns]
+    )
+    train_numeric = train_numeric.select_dtypes(include=[np.number, "bool"])
+
+    X_train = pd.concat(
+        [calendar_features(train_df["forecast_kst_dtm"]), train_numeric],
+        axis=1,
+    )
+
+    test_non_feature_cols = {
+        "forecast_id",
+        "forecast_kst_dtm",
+        "ldaps_data_available_kst_dtm",
+        "gfs_data_available_kst_dtm",
+    }
+    test_numeric = test_df.drop(
+        columns=[col for col in test_non_feature_cols if col in test_df.columns]
+    )
+    test_numeric = test_numeric.select_dtypes(include=[np.number, "bool"])
+
+    X_test = pd.concat(
+        [calendar_features(test_df["forecast_kst_dtm"]), test_numeric],
+        axis=1,
+    )
+
+    drop_cols = [c for c in EXCLUDED_FEATURES if c in X_train.columns]
+    if drop_cols:
+        print(f"제외 feature 적용: {drop_cols}")
+        X_train = X_train.drop(columns=drop_cols)
+        X_test = X_test.drop(columns=[c for c in drop_cols if c in X_test.columns])
+
+    missing_test_cols = [col for col in X_train.columns if col not in X_test.columns]
+    extra_test_cols = [col for col in X_test.columns if col not in X_train.columns]
+    if missing_test_cols or extra_test_cols:
+        raise ValueError(
+            "TRAIN/TEST 피처 컬럼이 다릅니다. "
+            f"TEST 누락={missing_test_cols[:10]}, TEST 추가={extra_test_cols[:10]}"
+        )
     X_test = X_test[X_train.columns]
+
+    audit = _build_audit(
+        mode=mode,
+        cutoff=cutoff,
+        validation_start=actual_validation_start,
+        train_labels_all=train_labels_all,
+        labels_used=labels_used,
+        scada_vestas_all=scada_vestas_all,
+        scada_vestas_fit=scada_vestas_fit,
+        scada_unison_all=scada_unison_all,
+        scada_unison_fit=scada_unison_fit,
+    )
+    train_df.attrs["leakage_audit"] = audit
+    test_df.attrs["leakage_audit"] = audit
 
     return train_df, X_train, test_df, X_test, sample_sub
 
-########## LDAPS ##########
-# LDAPS 풍속 시어 지수 (grid_id별 행 단위)
-def add_alpha_shear_ldaps(df):
-    df = df.copy()
-    u10 = df["heightAboveGround_10_10u"]
-    v10 = df["heightAboveGround_10_10v"]
-    ws10 = np.sqrt(u10**2 + v10**2)
 
-    u50 = (df["heightAboveGround_50_50MUmax"] + df["heightAboveGround_50_50MUmin"]) / 2
-    v50 = (df["heightAboveGround_50_50MVmax"] + df["heightAboveGround_50_50MVmin"]) / 2
-    ws50 = np.sqrt(u50**2 + v50**2)
-
-    alpha = np.log((ws50 + 1e-8) / (ws10 + 1e-8)) / np.log(50 / 10)
-    df["alpha_shear_ldaps"] = np.clip(alpha, -0.5, 1.0)
-    out = df.groupby("forecast_kst_dtm", as_index=False)["alpha_shear_ldaps"].mean()
-    return out
-
-# 117m 허브 높이 보간 풍속 
-# (grid_id별 행 단위, alpha_shear_ldaps 재계산 포함)
-def add_ws117_power_ldaps(df):
-    u10 = df["heightAboveGround_10_10u"]
-    v10 = df["heightAboveGround_10_10v"]
-    ws10 = np.sqrt(u10**2 + v10**2)
-
-    u50 = (df["heightAboveGround_50_50MUmax"] + df["heightAboveGround_50_50MUmin"]) / 2
-    v50 = (df["heightAboveGround_50_50MVmax"] + df["heightAboveGround_50_50MVmin"]) / 2
-    ws50 = np.sqrt(u50**2 + v50**2)
-
-    alpha = np.clip(np.log((ws50 + 1e-8) / (ws10 + 1e-8)) / np.log(50 / 10), -0.5, 1.0)
-    scale = (117 / 50) ** alpha
-    u117 = u50 * scale
-    v117 = v50 * scale
-    df["ws117_power_ldaps"] = np.sqrt(u117**2 + v117**2)
-    return df
-
-# LDAPS 117m 보정 풍향 (도 단위 0~360, grid_id별 행 단위)
-# ws117_power_ldaps와 같은 u117/v117 계산을 다시 하지만(중복 허용 방침), 이번엔 크기 대신 방향을 저장
-def add_wd117_ldaps(df):
-    u10 = df["heightAboveGround_10_10u"]
-    v10 = df["heightAboveGround_10_10v"]
-    ws10 = np.sqrt(u10**2 + v10**2)
-
-    u50 = (df["heightAboveGround_50_50MUmax"] + df["heightAboveGround_50_50MUmin"]) / 2
-    v50 = (df["heightAboveGround_50_50MVmax"] + df["heightAboveGround_50_50MVmin"]) / 2
-    ws50 = np.sqrt(u50**2 + v50**2)
-
-    alpha = np.clip(np.log((ws50 + 1e-8) / (ws10 + 1e-8)) / np.log(50 / 10), -0.5, 1.0)
-    scale = (117 / 50) ** alpha
-    u117 = u50 * scale
-    v117 = v50 * scale
-
-    # 기상학적 관례(바람이 "불어오는" 방향) + 0~360도로 보정
-    df["wd117_ldaps"] = np.degrees(np.arctan2(-u117, -v117)) % 360
-    return df
-
-# LDAPS 국소 격자별 117m 보정 풍향 pivot (i = 1~16), add_ws117_ldaps_grid와 동일한 방식
-def add_wd117_ldaps_grid(df):
-    df = df.copy()
-    df["forecast_kst_dtm"] = pd.to_datetime(df["forecast_kst_dtm"])
-    grid_wide = df.pivot(index="forecast_kst_dtm", columns="grid_id", values="wd117_ldaps")
-    grid_wide.columns = [f"wd117_ldaps_grid_{int(g)}" for g in grid_wide.columns]
-    return grid_wide.reset_index()
-
-# LDAPS 국소 공기 밀도 
-# (grid_id별 행 단위)
-def add_air_density_ldaps(df):
-    df = df.copy()
-    df["air_density_ldaps"] = df["surface_0_sp"] / (287.058 * df["heightAboveGround_2_t"])
-    out = df.groupby("forecast_kst_dtm", as_index=False)["air_density_ldaps"].mean()
-    return out
-
-# LDAPS 전격자 117m 풍속 공간 평균 
-# (시간당 1행으로 변환)
-def add_ws117_ldaps_spatial_mean(df):
-    grid_cols = [c for c in df.columns if c.startswith("ws117_ldaps_grid_")]
-    df["ws117_ldaps_spatial_mean"] = df[grid_cols].mean(axis=1)
-    return df
-
-# LDAPS 국소 기압경도 
-# (해면기압 격자간 차이, 시간당 1행으로 변환)
-def add_prmsl_range_ldaps(df):
-    out = df.groupby("forecast_kst_dtm")["meanSea_0_prmsl"].agg(lambda x: x.max() - x.min())
-    out = out.rename("prmsl_range_ldaps").reset_index()
-    return out
-
-# 117m 풍속 3승 변수 
-# (시간당 1행, ws117_ldaps_spatial_mean 필요)
-def add_ws117_cube_ldaps(df):
-    df["ws117_cube_ldaps"] = df["ws117_ldaps_spatial_mean"] ** 3
-    return df
-
-# 바람 운동 에너지 플럭스 
-# (시간당 1행, air_density_ldaps・ws117_cube_ldaps 필요)
-def add_wind_energy_flux_ldaps(df):
-    df["wind_energy_flux_ldaps"] = 0.5 * df["air_density_ldaps"] * df["ws117_cube_ldaps"]
-    return df
-
-# 117m 풍속 1시간 차분 
-# (시간당 1행, ws117_ldaps_spatial_mean 필요)
-def add_ws117_diff_1h_ldaps(df):
-    df = df.sort_values("forecast_kst_dtm").reset_index(drop=True)
-    df["ws117_diff_1h_ldaps"] = df["ws117_ldaps_spatial_mean"].diff(1)
-    return df
-
-# 24시간 전 예보 풍속 
-# (시간당 1행, ws117_ldaps_spatial_mean 필요)
-def add_ws117_lag_24h_ldaps(df):
-    df = df.sort_values("forecast_kst_dtm").reset_index(drop=True)
-    df["ws117_lag_24h_ldaps"] = df["ws117_ldaps_spatial_mean"].shift(24)
-    return df
-
-# 6시간 롤링 이동평균 
-# (시간당 1행, ws117_ldaps_spatial_mean 필요)
-def add_ws117_roll_mean_6h_ldaps(df):
-    df = df.sort_values("forecast_kst_dtm").reset_index(drop=True)
-    df["ws117_roll_mean_6h_ldaps"] = df["ws117_ldaps_spatial_mean"].rolling(window=6, min_periods=1).mean()
-    return df
-
-# 6시간 롤링 표준편차 
-# (시간당 1행, ws117_ldaps_spatial_mean 필요)
-def add_ws117_roll_std_6h_ldaps(df):
-    df = df.sort_values("forecast_kst_dtm").reset_index(drop=True)
-    df["ws117_roll_std_6h_ldaps"] = df["ws117_ldaps_spatial_mean"].rolling(window=6, min_periods=2).std()
-    return df
-
-# LDAPS 국소 격자별 117m 보간 풍속 (i = 1~16)
-def add_ws117_ldaps_grid(df):
-    df = df.copy()  
-    df["forecast_kst_dtm"] = pd.to_datetime(df["forecast_kst_dtm"])
-    grid_wide = df.pivot(index="forecast_kst_dtm", columns="grid_id", values="ws117_power_ldaps")
-    grid_wide.columns = [f"ws117_ldaps_grid_{int(g)}" for g in grid_wide.columns]
-    return grid_wide.reset_index()
-
-
-########## GFS ##########
-# GFS 풍속 시어 지수 (grid_id별 행 단위, 100m/10m 기준)
-def add_alpha_shear_gfs(df):
-    u10 = df["heightAboveGround_10_10u"]
-    v10 = df["heightAboveGround_10_10v"]
-    ws10 = np.sqrt(u10**2 + v10**2)
-
-    u100 = df["heightAboveGround_100_100u"]
-    v100 = df["heightAboveGround_100_100v"]
-    ws100 = np.sqrt(u100**2 + v100**2)
-
-    alpha = np.log((ws100 + 1e-8) / (ws10 + 1e-8)) / np.log(100 / 10)
-    df["alpha_shear_gfs"] = np.clip(alpha, -0.5, 1.0)
-    out = df.groupby("forecast_kst_dtm", as_index=False)["alpha_shear_gfs"].mean()
-    return out
-
-# 117m 허브 높이 보간 풍속 (GFS, grid_id별 행 단위)
-def add_ws117_power_gfs(df):
-    u10 = df["heightAboveGround_10_10u"]
-    v10 = df["heightAboveGround_10_10v"]
-    ws10 = np.sqrt(u10**2 + v10**2)
-
-    u100 = df["heightAboveGround_100_100u"]
-    v100 = df["heightAboveGround_100_100v"]
-    ws100 = np.sqrt(u100**2 + v100**2)
-
-    alpha = np.clip(np.log((ws100 + 1e-8) / (ws10 + 1e-8)) / np.log(100 / 10), -0.5, 1.0)
-    df["ws117_power_gfs"] = ws100 * (117 / 100) ** alpha
-    return df
-
-# GFS 광역 공기 밀도 (grid_id별 행 단위)
-def add_air_density_gfs(df):
-    df = df.copy()
-    df["air_density_gfs"] = df["surface_0_sp"] / (287.058 * df["heightAboveGround_2_2t"])
-    out = df.groupby("forecast_kst_dtm", as_index=False)["air_density_gfs"].mean()
-    return out
-
-# GFS 광역 격자별 117m 보간 풍속 pivot (i = 1~9)
-def add_ws117_gfs_grid(df):
-    df = df.copy()
-    df["forecast_kst_dtm"] = pd.to_datetime(df["forecast_kst_dtm"])
-    grid_wide = df.pivot(index="forecast_kst_dtm", columns="grid_id", values="ws117_power_gfs")
-    grid_wide.columns = [f"ws117_gfs_grid_{int(g)}" for g in grid_wide.columns]
-    return grid_wide.reset_index()
-
-# GFS 전격자 117m 풍속 공간 평균 (시간당 1행, ws117_gfs_grid_{i} 필요)
-def add_ws117_gfs_spatial_mean(df):
-    grid_cols = [c for c in df.columns if c.startswith("ws117_gfs_grid_")]
-    df["ws117_gfs_spatial_mean"] = df[grid_cols].mean(axis=1)
-    return df
-
-# GFS 광역 기압경도 (해면기압 격자간 차이, 시간당 1행)
-def add_prmsl_range_gfs(df):
-    out = df.groupby("forecast_kst_dtm")["meanSea_0_prmsl"].agg(lambda x: x.max() - x.min())
-    out = out.rename("prmsl_range_gfs").reset_index()
-    return out
-
-# 117m 풍속 3승 (GFS, 시간당 1행, ws117_gfs_spatial_mean 필요)
-def add_ws117_cube_gfs(df):
-    df["ws117_cube_gfs"] = df["ws117_gfs_spatial_mean"] ** 3
-    return df
-
-# 바람 운동 에너지 플럭스 (GFS, 시간당 1행, air_density_gfs·ws117_cube_gfs 필요)
-def add_wind_energy_flux_gfs(df):
-    df["wind_energy_flux_gfs"] = 0.5 * df["air_density_gfs"] * df["ws117_cube_gfs"]
-    return df
-
-# 117m 풍속 1시간 차분 (GFS, 시간당 1행, ws117_gfs_spatial_mean 필요)
-def add_ws117_diff_1h_gfs(df):
-    df = df.sort_values("forecast_kst_dtm").reset_index(drop=True)
-    df["ws117_diff_1h_gfs"] = df["ws117_gfs_spatial_mean"].diff(1)
-    return df
-
-# 24시간 전 예보 풍속 (GFS, 시간당 1행, ws117_gfs_spatial_mean 필요)
-def add_ws117_lag_24h_gfs(df):
-    df = df.sort_values("forecast_kst_dtm").reset_index(drop=True)
-    df["ws117_lag_24h_gfs"] = df["ws117_gfs_spatial_mean"].shift(24)
-    return df
-
-# 6시간 롤링 이동평균 (GFS, 시간당 1행, ws117_gfs_spatial_mean 필요)
-def add_ws117_roll_mean_6h_gfs(df):
-    df = df.sort_values("forecast_kst_dtm").reset_index(drop=True)
-    df["ws117_roll_mean_6h_gfs"] = df["ws117_gfs_spatial_mean"].rolling(window=6, min_periods=1).mean()
-    return df
-
-# 6시간 롤링 표준편차 (GFS, 시간당 1행, ws117_gfs_spatial_mean 필요)
-def add_ws117_roll_std_6h_gfs(df):
-    df = df.sort_values("forecast_kst_dtm").reset_index(drop=True)
-    df["ws117_roll_std_6h_gfs"] = df["ws117_gfs_spatial_mean"].rolling(window=6, min_periods=2).std()
-    return df
-
-
-
-########## SCADA ##########
-# UNISON 보정 풍향 
-# (음수/360 초과 값을 0~360 범위로 보정, 1~5호기)
-def add_unison_wd_360(scada_unison_train):
-    df = scada_unison_train.copy()
-    for i in range(1, 6):
-        col = f"unison_wtg{i:02d}_wd"
-        df[f"{col}_360"] = (df[col] + 360) % 360
-    return df
-
-# VESTAS Power 값 추정 
-# (1~12호기 전체 통합, 풍속bin 중앙값 발전량 합산)
-def add_vestas_power_curve_pred(scada_vestas_train, ws_bin_width=0.5, min_count=30):
-    df = scada_vestas_train.copy()
-    turbines = [f"vestas_wtg{i:02d}" for i in range(1, 13)]
-    preds = []
-    for wtg in turbines:
-        power = df[f"{wtg}_power_kw10m"]
-        ws_bin = np.floor(df[f"{wtg}_ws"] / ws_bin_width)
-        temp = pd.DataFrame({"power": power, "ws_bin": ws_bin})
-        median_val = temp.groupby("ws_bin")["power"].transform("median")
-        count_val = temp.groupby("ws_bin")["power"].transform("count")
-        preds.append(median_val.where(count_val >= min_count))
-    df["vestas_power_curve_pred"] = pd.concat(preds, axis=1).sum(axis=1, min_count=1)
-    return df
-
-# UNISON Power 값 추정 
-# (1~5호기 전체 통합, 풍속bin 중앙값 발전량 합산)
-def add_unison_power_curve_pred(scada_unison_train, ws_bin_width=0.5, min_count=30):
-    df = scada_unison_train.copy()
-    turbines = [f"unison_wtg{i:02d}" for i in range(1, 6)]
-    preds = []
-    for wtg in turbines:
-        power = df[f"{wtg}_power_kw10m"]
-        ws_bin = np.floor(df[f"{wtg}_ws"] / ws_bin_width)
-        temp = pd.DataFrame({"power": power, "ws_bin": ws_bin})
-        median_val = temp.groupby("ws_bin")["power"].transform("median")
-        count_val = temp.groupby("ws_bin")["power"].transform("count")
-        preds.append(median_val.where(count_val >= min_count))
-    df["unison_power_curve_pred"] = pd.concat(preds, axis=1).sum(axis=1, min_count=1)
-    return df
-
-# VESTAS group1 power값 추정 (1~6호기)
-def add_vestas_power_curve_pred_group1(scada_vestas_train, ws_bin_width=0.5, min_count=30):
-    df = scada_vestas_train.copy()
-    turbines = [f"vestas_wtg{i:02d}" for i in range(1, 7)]
-    preds = []
-    for wtg in turbines:
-        power = df[f"{wtg}_power_kw10m"]
-        ws_bin = np.floor(df[f"{wtg}_ws"] / ws_bin_width)
-        temp = pd.DataFrame({"power": power, "ws_bin": ws_bin})
-        median_val = temp.groupby("ws_bin")["power"].transform("median")
-        count_val = temp.groupby("ws_bin")["power"].transform("count")
-        preds.append(median_val.where(count_val >= min_count))
-    df["vestas_power_curve_pred_group1"] = pd.concat(preds, axis=1).sum(axis=1, min_count=1)
-    return df
-
-# VESTAS group2 power값 추정 (7~12호기)
-def add_vestas_power_curve_pred_group2(scada_vestas_train, ws_bin_width=0.5, min_count=30):
-    df = scada_vestas_train.copy()
-    turbines = [f"vestas_wtg{i:02d}" for i in range(7, 13)]
-    preds = []
-    for wtg in turbines:
-        power = df[f"{wtg}_power_kw10m"]
-        ws_bin = np.floor(df[f"{wtg}_ws"] / ws_bin_width)
-        temp = pd.DataFrame({"power": power, "ws_bin": ws_bin})
-        median_val = temp.groupby("ws_bin")["power"].transform("median")
-        count_val = temp.groupby("ws_bin")["power"].transform("count")
-        preds.append(median_val.where(count_val >= min_count))
-    df["vestas_power_curve_pred_group2"] = pd.concat(preds, axis=1).sum(axis=1, min_count=1)
-    return df
-
-# VESTAS group1 터빈별 상대 출력 계수 
-# (1~6호기 E_i의 그룹 평균 1개 값)
-def add_vestas_turbine_efficiency_group1(scada_vestas_train, ws_bin_width=0.5, eps=1e-8):
-    df = scada_vestas_train.copy()
-    turbines = [f"vestas_wtg{i:02d}" for i in range(1, 7)]
-    turbine_eff = []
-    for wtg in turbines:
-        power = df[f"{wtg}_power_kw10m"]
-        ws_bin = np.floor(df[f"{wtg}_ws"] / ws_bin_width)
-        temp = pd.DataFrame({"power": power, "ws_bin": ws_bin})
-        curve_pred = temp.groupby("ws_bin")["power"].transform("median")
-        turbine_eff.append((curve_pred / (power + eps)).median())
-    df["vestas_turbine_efficiency_group1"] = np.mean(turbine_eff)
-    return df
-
-# VESTAS group2 터빈별 상대 출력 계수 
-# (7~12호기 E_i의 그룹 평균 1개 값)
-def add_vestas_turbine_efficiency_group2(scada_vestas_train, ws_bin_width=0.5, eps=1e-8):
-    df = scada_vestas_train.copy()
-    turbines = [f"vestas_wtg{i:02d}" for i in range(7, 13)]
-    turbine_eff = []
-    for wtg in turbines:
-        power = df[f"{wtg}_power_kw10m"]
-        ws_bin = np.floor(df[f"{wtg}_ws"] / ws_bin_width)
-        temp = pd.DataFrame({"power": power, "ws_bin": ws_bin})
-        curve_pred = temp.groupby("ws_bin")["power"].transform("median")
-        turbine_eff.append((curve_pred / (power + eps)).median())
-    df["vestas_turbine_efficiency_group2"] = np.mean(turbine_eff)
-    return df
-
-# UNISON 터빈별 상대 출력 계수 
-# (1~5호기 E_i의 그룹 평균 1개 값)
-def add_unison_turbine_efficiency(scada_unison_train, ws_bin_width=0.5, eps=1e-8):
-    df = scada_unison_train.copy()
-    turbines = [f"unison_wtg{i:02d}" for i in range(1, 6)]
-    turbine_eff = []
-    for wtg in turbines:
-        power = df[f"{wtg}_power_kw10m"]
-        ws_bin = np.floor(df[f"{wtg}_ws"] / ws_bin_width)
-        temp = pd.DataFrame({"power": power, "ws_bin": ws_bin})
-        curve_pred = temp.groupby("ws_bin")["power"].transform("median")
-        turbine_eff.append((curve_pred / (power + eps)).median())
-    df["unison_turbine_efficiency"] = np.mean(turbine_eff)
-    return df
-
-# VESTAS group1 조건별 발전량 변동성 
-# (1~6호기, 풍속·풍향 bin별 표준편차)
-def add_vestas_power_variability_group1(scada_vestas_train, ws_bin_width=0.5, wd_bin_width=30, min_count=30):
-    df = scada_vestas_train.copy()
-    turbines = [f"vestas_wtg{i:02d}" for i in range(1, 7)]
-    per_turbine = []
-    for wtg in turbines:
-        power = df[f"{wtg}_power_kw10m"]
-        ws_bin = np.floor(df[f"{wtg}_ws"] / ws_bin_width)
-        wd_bin = np.floor((df[f"{wtg}_wd"] % 360) / wd_bin_width)
-        temp = pd.DataFrame({"power": power, "ws_bin": ws_bin, "wd_bin": wd_bin})
-        std_val = temp.groupby(["ws_bin", "wd_bin"])["power"].transform("std")
-        count_val = temp.groupby(["ws_bin", "wd_bin"])["power"].transform("count")
-        per_turbine.append(std_val.where(count_val >= min_count))
-    df["vestas_power_variability_group1"] = pd.concat(per_turbine, axis=1).mean(axis=1)
-    return df
-
-# VESTAS group2 조건별 발전량 변동성 
-# (7~12호기, 풍속·풍향 bin별 표준편차)
-def add_vestas_power_variability_group2(scada_vestas_train, ws_bin_width=0.5, wd_bin_width=30, min_count=30):
-    df = scada_vestas_train.copy()
-    turbines = [f"vestas_wtg{i:02d}" for i in range(7, 13)]
-    per_turbine = []
-    for wtg in turbines:
-        power = df[f"{wtg}_power_kw10m"]
-        ws_bin = np.floor(df[f"{wtg}_ws"] / ws_bin_width)
-        wd_bin = np.floor((df[f"{wtg}_wd"] % 360) / wd_bin_width)
-        temp = pd.DataFrame({"power": power, "ws_bin": ws_bin, "wd_bin": wd_bin})
-        std_val = temp.groupby(["ws_bin", "wd_bin"])["power"].transform("std")
-        count_val = temp.groupby(["ws_bin", "wd_bin"])["power"].transform("count")
-        per_turbine.append(std_val.where(count_val >= min_count))
-    df["vestas_power_variability_group2"] = pd.concat(per_turbine, axis=1).mean(axis=1)
-    return df
-
-# UNISON 터빈별 발전량 변동성 
-# (1~5호기, 풍속·풍향 bin별 표준편차)
-def add_unison_power_variability(scada_unison_train, ws_bin_width=0.5, wd_bin_width=30, min_count=30):
-    df = scada_unison_train.copy()
-    turbines = [f"unison_wtg{i:02d}" for i in range(1, 6)]
-    per_turbine = []
-    for wtg in turbines:
-        power = df[f"{wtg}_power_kw10m"]
-        ws_bin = np.floor(df[f"{wtg}_ws"] / ws_bin_width)
-        wd_bin = np.floor((df[f"{wtg}_wd"] % 360) / wd_bin_width)
-        temp = pd.DataFrame({"power": power, "ws_bin": ws_bin, "wd_bin": wd_bin})
-        std_val = temp.groupby(["ws_bin", "wd_bin"])["power"].transform("std")
-        count_val = temp.groupby(["ws_bin", "wd_bin"])["power"].transform("count")
-        per_turbine.append(std_val.where(count_val >= min_count))
-    df["unison_power_variability"] = pd.concat(per_turbine, axis=1).mean(axis=1)
-    return df
-
-
-########## 발전량 (이론적 파워커브) ##########
-# group1 이론상의 파워커브 추정 발전량 (LDAPS 기준)
-def add_power_curve_pred_group1_ldaps(df, grid_id):
-    ws117 = df[f"ws117_ldaps_grid_{grid_id}"].to_numpy(dtype=float)
-    pred = np.zeros_like(ws117)
-    ramp = (ws117 >= 3) & (ws117 < 12.0)
-    pred[ramp] = 21600 * ((ws117[ramp] - 3) / (12.0 - 3)) ** 3
-    flat = (ws117 >= 12.0) & (ws117 < 22.5)
-    pred[flat] = 21600
-    df["power_curve_pred_group1_ldaps"] = pred
-    return df
-
-# group2 이론상의 파워커브 추정 발전량 (LDAPS 기준)
-def add_power_curve_pred_group2_ldaps(df, grid_id):
-    ws117 = df[f"ws117_ldaps_grid_{grid_id}"].to_numpy(dtype=float)
-    pred = np.zeros_like(ws117)
-    ramp = (ws117 >= 3) & (ws117 < 12.0)
-    pred[ramp] = 21600 * ((ws117[ramp] - 3) / (12.0 - 3)) ** 3
-    flat = (ws117 >= 12.0) & (ws117 < 22.5)
-    pred[flat] = 21600
-    df["power_curve_pred_group2_ldaps"] = pred
-    return df
-
-# group3 이론상의 파워커브 추정 발전량 (LDAPS 기준, UNISON 스펙)
-def add_power_curve_pred_group3_ldaps(df, grid_id):
-    ws117 = df[f"ws117_ldaps_grid_{grid_id}"].to_numpy(dtype=float)
-    pred = np.zeros_like(ws117)
-    ramp = (ws117 >= 3) & (ws117 < 12.5)
-    pred[ramp] = 21000 * ((ws117[ramp] - 3) / (12.5 - 3)) ** 3
-    flat = (ws117 >= 12.5) & (ws117 < 22.0)
-    pred[flat] = 21000
-    df["power_curve_pred_group3_ldaps"] = pred
-    return df
-
-# group1 이론상의 파워커브 추정 발전량 (GFS 기준)
-def add_power_curve_pred_group1_gfs(df, grid_id):
-    ws117 = df[f"ws117_gfs_grid_{grid_id}"].to_numpy(dtype=float)
-    pred = np.zeros_like(ws117)
-    ramp = (ws117 >= 3) & (ws117 < 12.0)
-    pred[ramp] = 21600 * ((ws117[ramp] - 3) / (12.0 - 3)) ** 3
-    flat = (ws117 >= 12.0) & (ws117 < 22.5)
-    pred[flat] = 21600
-    df["power_curve_pred_group1_gfs"] = pred
-    return df
-
-# group2 이론상의 파워커브 추정 발전량 (GFS 기준)
-def add_power_curve_pred_group2_gfs(df, grid_id):
-    ws117 = df[f"ws117_gfs_grid_{grid_id}"].to_numpy(dtype=float)
-    pred = np.zeros_like(ws117)
-    ramp = (ws117 >= 3) & (ws117 < 12.0)
-    pred[ramp] = 21600 * ((ws117[ramp] - 3) / (12.0 - 3)) ** 3
-    flat = (ws117 >= 12.0) & (ws117 < 22.5)
-    pred[flat] = 21600
-    df["power_curve_pred_group2_gfs"] = pred
-    return df
-
-# group3 이론상의 파워커브 추정 발전량 (GFS 기준, UNISON 스펙)
-def add_power_curve_pred_group3_gfs(df, grid_id):
-    ws117 = df[f"ws117_gfs_grid_{grid_id}"].to_numpy(dtype=float)
-    pred = np.zeros_like(ws117)
-    ramp = (ws117 >= 3) & (ws117 < 12.5)
-    pred[ramp] = 21000 * ((ws117[ramp] - 3) / (12.5 - 3)) ** 3
-    flat = (ws117 >= 12.5) & (ws117 < 22.0)
-    pred[flat] = 21000
-    df["power_curve_pred_group3_gfs"] = pred
-    return df
-
-
-########## 기타-기상예보 ##########
-# 풍향 순환 인코딩(cos)
-def add_wd_cos(df):
-    u100 = df['heightAboveGround_100_100u']
-    v100 = df['heightAboveGround_100_100v']
-    
-    wind_dir = np.arctan2(-u100, -v100)
-    df['wd_cos'] = np.cos(wind_dir)
-    return df
-
-# 풍향 순환 인코딩(sin)
-def add_wd_sin(df):
-    u100 = df['heightAboveGround_100_100u']
-    v100 = df['heightAboveGround_100_100v']
-    
-    wind_dir = np.arctan2(-u100, -v100)
-    df['wd_sin'] = np.sin(wind_dir)
-    return df
-
-# 대기 난류강도 추정치
-def add_turbulence_intensity(df):
-    u10 = df['heightAboveGround_10_10u']
-    v10 = df['heightAboveGround_10_10v']
-    ws10 = np.sqrt(u10**2 + v10**2)
-    
-    df['turbulence_intensity'] = (df['surface_0_gust'] - ws10) / (ws10 + 1e-8)
-    return df
-
-# 연중 주기(cos)
-def add_dayofyear_cos(df):
-    dt = pd.to_datetime(df['forecast_kst_dtm'])
-    df['dayofyear_cos'] = np.cos(2 * np.pi * dt.dt.dayofyear / 365.25)
-    return df
-
-# 연중 주기(sin)
-def add_dayofyear_sin(df):
-    dt = pd.to_datetime(df['forecast_kst_dtm'])
-    df['dayofyear_sin'] = np.sin(2 * np.pi * dt.dt.dayofyear / 365.25)
-    return df
-
-# 일중 주기(cos)
-def add_hour_cos(df):
-    dt = pd.to_datetime(df['forecast_kst_dtm'])
-    df['hour_cos'] = np.cos(2 * np.pi * dt.dt.hour / 24)
-    return df
-
-# 일중 주기(sin)
-def add_hour_sin(df):
-    dt = pd.to_datetime(df['forecast_kst_dtm'])
-    df['hour_sin'] = np.sin(2 * np.pi * dt.dt.hour / 24)
-    return df
-
-# 117m 직교 방향 풍속
-def add_ws117_channel_cross(df):
-    u10 = df['heightAboveGround_10_10u']
-    v10 = df['heightAboveGround_10_10v']
-    ws10 = np.sqrt(u10**2 + v10**2)
-    
-    u100 = df['heightAboveGround_100_100u']
-    v100 = df['heightAboveGround_100_100v']
-    ws100 = np.sqrt(u100**2 + v100**2)
-    
-    alpha = np.log(ws100 / (ws10 + 1e-8)) / np.log(100/10)
-    
-    u117 = u100 * ((117/100) ** alpha)
-    v117 = v100 * ((117/100) ** alpha)
-    
-    # Group 1, 2 (VESTAS): 270도
-    theta_g12 = np.radians(270)
-    df['ws117_channel_cross_g12'] = u117 * np.cos(theta_g12) - v117 * np.sin(theta_g12)
-    
-    # Group 3 (UNISON): 45도
-    theta_g3 = np.radians(45)
-    df['ws117_channel_cross_g3'] = u117 * np.cos(theta_g3) - v117 * np.sin(theta_g3)
-    
-    return df
-
-# 117m 채널축 방향 풍속
-def add_ws117_channel_along(df):
-    u10 = df['heightAboveGround_10_10u']
-    v10 = df['heightAboveGround_10_10v']
-    ws10 = np.sqrt(u10**2 + v10**2)
-    
-    u100 = df['heightAboveGround_100_100u']
-    v100 = df['heightAboveGround_100_100v']
-    ws100 = np.sqrt(u100**2 + v100**2)
-    
-    alpha = np.log(ws100 / (ws10 + 1e-8)) / np.log(100/10)
-    
-    u117 = u100 * ((117/100) ** alpha)
-    v117 = v100 * ((117/100) ** alpha)
-    
-    # Group 1, 2 (VESTAS): 270도
-    theta_g12 = np.radians(270)
-    df['ws117_channel_along_g12'] = u117 * np.sin(theta_g12) + v117 * np.cos(theta_g12)
-    
-    # Group 3 (UNISON): 45도
-    theta_g3 = np.radians(45)
-    df['ws117_channel_along_g3'] = u117 * np.sin(theta_g3) + v117 * np.cos(theta_g3)
-    
-    return df
+def get_target_xy(
+    train_df: pd.DataFrame,
+    X_train: pd.DataFrame,
+    target: str,
+    subset: str = "fit",
+) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    타깃 결측과 시간 검증 마스크를 함께 적용한다.
+
+    subset="fit"       : 모델 학습 가능 구간
+    subset="validation": 검증 구간
+    subset="all"       : 타깃이 있는 전체 구간
+    """
+    if target not in TARGET_COLS:
+        raise ValueError(f"알 수 없는 target입니다: {target}")
+
+    mask = train_df[target].notna()
+    if subset == "fit":
+        mask &= train_df["_fit_eligible"]
+    elif subset == "validation":
+        mask &= train_df["_is_validation"]
+    elif subset != "all":
+        raise ValueError("subset은 'fit', 'validation', 'all' 중 하나여야 합니다.")
+
+    return (
+        X_train.loc[mask].reset_index(drop=True),
+        train_df.loc[mask, target].reset_index(drop=True),
+    )
+
+
+# 검증 윈도우를 계절 단위로 자름
+def get_bounded_validation_xy(train_df, X_train, target, validation_start, window_days=90):
+    """validation_start부터 window_days일 동안만 잘라낸 '한 계절짜리' 검증 구간을 반환한다."""
+    start_ts = pd.Timestamp(validation_start)
+    end_ts = start_ts + pd.Timedelta(days=window_days)
+    mask = (
+        train_df[target].notna()
+        & train_df["_is_validation"]
+        & (train_df["forecast_kst_dtm"] >= start_ts)
+        & (train_df["forecast_kst_dtm"] < end_ts)
+    )
+    return (
+        X_train.loc[mask].reset_index(drop=True),
+        train_df.loc[mask, target].reset_index(drop=True),
+        train_df.loc[mask, "forecast_kst_dtm"].reset_index(drop=True),
+    )

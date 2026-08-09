@@ -9,15 +9,15 @@ conda activate wind
 # 실행 모드 설정 (chronos, ensemble, chronos_ensemble 중 택 1)
 # 'autogluon', 'ensemble', 'ag_ensemble'
 # 'final', 'search'
-MODE="search"
+MODE="final"
 
 echo "=== [1/4] prepare_data.py 시작: $(date) ==="
 python prepare_data.py
-# python prepare_data_B.py
+# python prepare_data_all.py
 
 echo "=== [2/4] train.py 시작 (Mode: $MODE): $(date) ==="
 python train.py --mode $MODE
-# python train_B.py --mode $MODE
+# python train_XGB+LGBM.py --mode $MODE
 
 echo "=== [3/4] evaluate.py 시작: $(date) ==="
 python evaluate.py

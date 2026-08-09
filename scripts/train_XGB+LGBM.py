@@ -8,23 +8,20 @@ from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor
 from sklearn.impute import SimpleImputer
+from scipy.optimize import differential_evolution
+import matplotlib.pyplot as plt
+
 
 from config import (
     TARGET_COLS, CAPACITY_KWH, RF_PARAMS, ET_PARAMS, XGB_PARAMS, LGBM_PARAMS, OUTPUT_DIR,
     VALID_RATIO_THRESHOLD, EXCLUDE_INVALID_ROWS, INVALID_SAMPLE_WEIGHT,
     VAL_HOLDOUT_RATIO, EARLY_STOPPING_ROUNDS,
     OPTUNA_N_TRIALS, OPTUNA_SEED, OPTUNA_SEARCH_SPACE, HUBER_HESS_FLOOR,
-    BEST_LOSS_CONFIG,
+    BEST_LOSS_CONFIG, XGB_SEARCH_SPACE, LGBM_SEARCH_SPACE, BEST_MODEL_CONFIG,
 )
-from prepare_data_B import get_tabular_data
+from prepare_data_all import get_tabular_data
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-BASELINE_COL = {
-    "kpx_group_1": "power_curve_pred_lookup_group1_gfs",
-    "kpx_group_2": "power_curve_pred_lookup_group2_gfs",
-    "kpx_group_3": "power_curve_pred_lookup_group3_gfs",
-}
 
 
 # ============================================
@@ -138,40 +135,32 @@ def _lgb_objective_wrapper(base_obj_fn):
     return _wrapped
 
 
-def _fit_xgb_with_params(loss_name, params, X_tr, y_tr, sw_tr, X_val, y_val, capacity, baseline_tr, baseline_val):
+def _fit_xgb_with_params(loss_name, params, X_tr, y_tr, sw_tr, X_val, y_val, capacity, model_params=None):
     obj_fn = LOSS_BUILDERS[loss_name](capacity, **params)
-    xgb_kwargs = {k: v for k, v in XGB_PARAMS.items()}
+    xgb_kwargs = dict(model_params) if model_params is not None else {k: v for k, v in XGB_PARAMS.items()}
     model = XGBRegressor(
         **xgb_kwargs,
         objective=obj_fn,
         eval_metric=lambda y_true, y_pred: _neg_ficr(y_true, y_pred, capacity),
         early_stopping_rounds=EARLY_STOPPING_ROUNDS,
     )
-    model.fit(
-        X_tr, y_tr, sample_weight=sw_tr,
-        base_margin=baseline_tr,
-        eval_set=[(X_val, y_val)],
-        base_margin_eval_set=[baseline_val],
-        verbose=False,
-    )
-    val_pred = model.predict(X_val, base_margin=baseline_val)   # ← predict할 때도 반드시 넘겨야 함
+    model.fit(X_tr, y_tr, sample_weight=sw_tr, eval_set=[(X_val, y_val)], verbose=False)
+    val_pred = model.predict(X_val)
     val_ficr = _true_ficr(y_val.values, val_pred, capacity)
     return model, val_ficr
 
 
-def _fit_lgbm_with_params(loss_name, params, lgbm_params, X_tr, y_tr, sw_tr, X_val, y_val, capacity, baseline_tr, baseline_val):
+def _fit_lgbm_with_params(loss_name, params, lgbm_params, X_tr, y_tr, sw_tr, X_val, y_val, capacity):
     base_obj_fn = LOSS_BUILDERS[loss_name](capacity, **params)
     obj_fn = _lgb_objective_wrapper(base_obj_fn)
     model = LGBMRegressor(**lgbm_params, objective=obj_fn)
     model.fit(
         X_tr, y_tr, sample_weight=sw_tr,
-        init_score=baseline_tr,
         eval_set=[(X_val, y_val)],
-        eval_init_score=[baseline_val],
         eval_metric=lambda y_true, y_pred: _lgb_ficr(y_true, y_pred, capacity),
         callbacks=[lgb.early_stopping(stopping_rounds=EARLY_STOPPING_ROUNDS, verbose=False)],
     )
-    val_pred = model.predict(X_val) + baseline_val.to_numpy()   # ← predict()는 baseline을 자동으로 안 더해줌, 직접 더함
+    val_pred = model.predict(X_val)
     val_ficr = _true_ficr(y_val.values, val_pred, capacity)
     return model, val_ficr
 
@@ -191,9 +180,27 @@ def _suggest_params(trial, loss_name):
             params[name] = trial.suggest_float(name, spec["low"], spec["high"], log=spec.get("log", False))
     return params
 
+def _suggest_model_params(trial, model_type):
+    """모델 구조 하이퍼파라미터(n_estimators, depth 등)를 제안하고,
+    탐색 대상이 아닌 고정 설정(random_state, n_jobs 등)과 합쳐서 완전한 파라미터 dict를 반환."""
+    if model_type == "XGB":
+        space = XGB_SEARCH_SPACE
+        base = {k: v for k, v in XGB_PARAMS.items() if k not in space}
+    else:
+        space = LGBM_SEARCH_SPACE
+        base = {k: v for k, v in LGBM_PARAMS.items() if k not in space}
+        base["importance_type"] = "gain"  # 기존 코드에서 하던 설정 유지
+
+    suggested = {}
+    for name, spec in space.items():
+        if spec.get("type") == "int":
+            suggested[name] = trial.suggest_int(name, spec["low"], spec["high"], log=spec.get("log", False))
+        else:
+            suggested[name] = trial.suggest_float(name, spec["low"], spec["high"], log=spec.get("log", False))
+    return {**base, **suggested}
 
 def _run_optuna_search(model_type, target, capacity, lgbm_params, X_tr, y_tr, sw_tr, X_val, y_val, search_log,
-                        baseline_tr, baseline_val, warm_start=None):
+                        warm_start=None):
     """손실함수별로 별도 study를 돌려 예산을 나누지 않음.
     warm_start: {"huber_capacity": {...}, "threshold_weighted": {...}, "smooth_ficr": {...}} 형태로
     각 손실함수별 시작점을 넣을 수 있음 (그룹별로 다르게 넣어야 효과적)."""
@@ -211,12 +218,14 @@ def _run_optuna_search(model_type, target, capacity, lgbm_params, X_tr, y_tr, sw
             study.enqueue_trial(warm_start[loss_name])
 
         def _obj(trial, loss_name=loss_name):
-            params = _suggest_params(trial, loss_name)
+            params = _suggest_params(trial, loss_name)  # 손실함수 파라미터
+            model_params = _suggest_model_params(trial, model_type)  # [신규] 모델 구조 파라미터
             if model_type == "XGB":
-                _, val_ficr = _fit_xgb_with_params(loss_name, params, X_tr, y_tr, sw_tr, X_val, y_val, capacity, baseline_tr, baseline_val)
+                _, val_ficr = _fit_xgb_with_params(loss_name, params, X_tr, y_tr, sw_tr, X_val, y_val, capacity, model_params)
             else:
-                _, val_ficr = _fit_lgbm_with_params(loss_name, params, lgbm_params, X_tr, y_tr, sw_tr, X_val, y_val, capacity, baseline_tr, baseline_val)
+                _, val_ficr = _fit_lgbm_with_params(loss_name, params, model_params, X_tr, y_tr, sw_tr, X_val, y_val, capacity)
             trial.set_user_attr("params", params)
+            trial.set_user_attr("model_params", model_params)  # [신규] 같이 기록
             return val_ficr
 
         study.optimize(_obj, n_trials=n_trials_this_loss, show_progress_bar=False)
@@ -224,7 +233,9 @@ def _run_optuna_search(model_type, target, capacity, lgbm_params, X_tr, y_tr, sw
         for t in study.trials:
             search_log.append({
                 "target": target, "model": model_type, "loss_name": loss_name,
-                "params": str(t.user_attrs.get("params")), "val_ficr": t.value,
+                "params": str(t.user_attrs.get("params")),
+                "model_params": str(t.user_attrs.get("model_params")),  # [신규]
+                "val_ficr": t.value,
             })
 
         if study.best_value > best_overall["val_ficr"]:
@@ -232,15 +243,16 @@ def _run_optuna_search(model_type, target, capacity, lgbm_params, X_tr, y_tr, sw
                 "val_ficr": study.best_value,
                 "loss_name": loss_name,
                 "params": study.best_trial.user_attrs["params"],
+                "model_params": study.best_trial.user_attrs["model_params"],  # [신규]
             }
 
     print(f"  [{target}][{model_type}] Optuna 최종 선택: {best_overall['loss_name']} "
           f"params={best_overall['params']} val_ficr={best_overall['val_ficr']:.4f}")
 
     if model_type == "XGB":
-        best_model, _ = _fit_xgb_with_params(best_overall["loss_name"], best_overall["params"], X_tr, y_tr, sw_tr, X_val, y_val, capacity, baseline_tr, baseline_val)
+        best_model, _ = _fit_xgb_with_params(best_overall["loss_name"], best_overall["params"], X_tr, y_tr, sw_tr, X_val, y_val, capacity, best_overall["model_params"])
     else:
-        best_model, _ = _fit_lgbm_with_params(best_overall["loss_name"], best_overall["params"], lgbm_params, X_tr, y_tr, sw_tr, X_val, y_val, capacity, baseline_tr, baseline_val)
+        best_model, _ = _fit_lgbm_with_params(best_overall["loss_name"], best_overall["params"], best_overall["model_params"], X_tr, y_tr, sw_tr, X_val, y_val, capacity)
 
     return {"model": best_model, **best_overall}
 
@@ -250,6 +262,30 @@ def _record_importance(raw_df, norm_df, target, name, imp_vals):
     raw_df[col_name] = imp_vals
     val_min, val_max = imp_vals.min(), imp_vals.max()
     norm_df[col_name] = (imp_vals - val_min) / (val_max - val_min) if val_max > val_min else np.zeros_like(imp_vals)
+
+def _optimize_ensemble_weights(val_preds, y_val, capacity, seed=42):
+    """검증셋에서 FICR을 최대화하는 모델별 앙상블 가중치(합=1, 0 이상)를 탐색.
+    val_preds: [rf_val_pred, et_val_pred, xgb_val_pred, lgb_val_pred] 형태의 리스트
+    FICR이 6%/8% 경계에서 끊기는 비연속 함수라 그래디언트 기반 최적화 대신
+    블랙박스 전역 탐색(differential_evolution)을 사용."""
+    val_preds = np.array(val_preds)  # shape: (n_models, n_samples)
+    n_models = val_preds.shape[0]
+
+    def neg_ficr_for_weights(raw_weights):
+        w = np.clip(raw_weights, 0, None)
+        if w.sum() == 0:
+            return 0.0
+        w = w / w.sum()
+        blended = np.average(val_preds, axis=0, weights=w)
+        return -_true_ficr(y_val, blended, capacity)
+
+    result = differential_evolution(
+        neg_ficr_for_weights, bounds=[(0, 1)] * n_models,
+        seed=seed, maxiter=100, tol=1e-6, polish=True,
+    )
+    w = np.clip(result.x, 0, None)
+    w = w / w.sum() if w.sum() > 0 else np.ones(n_models) / n_models
+    return w
 
 
 def _prepare_common(train_df, X_train, X_test, sample_sub):
@@ -264,7 +300,6 @@ def _split_group_data(train_df, X_train_imp, target, capacity):
     train_mask = train_df[target].notna()
     y_full = train_df.loc[train_mask, target]
     X_full = X_train_imp.loc[train_mask]
-    baseline_full = X_full[BASELINE_COL[target]]   # X_train에 이미 있는 피처를 baseline으로도 재사용
 
     valid_mask = y_full >= capacity * VALID_RATIO_THRESHOLD
     print(f"  [{target}] 전체 {len(y_full)}행 중 무효구간(10%미만) {(~valid_mask).sum()}행 "
@@ -273,21 +308,19 @@ def _split_group_data(train_df, X_train_imp, target, capacity):
     if EXCLUDE_INVALID_ROWS:
         X_train_use = X_full[valid_mask].reset_index(drop=True)
         y_train_use = y_full[valid_mask].reset_index(drop=True)
-        baseline_use = baseline_full[valid_mask].reset_index(drop=True)
         sw_use = np.ones(len(y_train_use))
     else:
         X_train_use = X_full.reset_index(drop=True)
         y_train_use = y_full.reset_index(drop=True)
-        baseline_use = baseline_full.reset_index(drop=True)
         sw_use = np.where(valid_mask.reset_index(drop=True), 1.0, INVALID_SAMPLE_WEIGHT)
 
     split_idx = int(len(y_train_use) * (1 - VAL_HOLDOUT_RATIO))
     X_tr, X_val = X_train_use.iloc[:split_idx], X_train_use.iloc[split_idx:]
     y_tr, y_val = y_train_use.iloc[:split_idx], y_train_use.iloc[split_idx:]
-    baseline_tr, baseline_val = baseline_use.iloc[:split_idx], baseline_use.iloc[split_idx:]
     sw_tr = sw_use[:split_idx]
 
-    return X_train_use, y_train_use, sw_use, X_tr, y_tr, sw_tr, X_val, y_val, baseline_tr, baseline_val
+    return X_train_use, y_train_use, sw_use, X_tr, y_tr, sw_tr, X_val, y_val
+
 
 # ============================================
 # 기존: Optuna 탐색 기반 학습 (그대로 유지, 삭제하지 않음)
@@ -308,23 +341,23 @@ def train_ensemble(train_df, X_train, X_test, sample_sub):
 
     for target in TARGET_COLS:
         capacity = CAPACITY_KWH[target]
-        X_train_use, y_train_use, sw_use, X_tr, y_tr, sw_tr, X_val, y_val, baseline_tr, baseline_val = \
-            _split_group_data(train_df, X_train_imp, target, capacity)
+        X_train_use, y_train_use, sw_use, X_tr, y_tr, sw_tr, X_val, y_val = _split_group_data(
+            train_df, X_train_imp, target, capacity
+        )
 
         preds = []
 
-        rf = RandomForestRegressor(**RF_PARAMS)
-        rf.fit(X_train_use, y_train_use, sample_weight=sw_use)
-        preds.append(rf.predict(X_test_imp))
-        print(f"  [{target}] RF Trained.")
-        _record_importance(raw_feature_importances, norm_feature_importances, target, "RF", rf.feature_importances_)
+        # rf = RandomForestRegressor(**RF_PARAMS)
+        # rf.fit(X_train_use, y_train_use, sample_weight=sw_use)
+        # preds.append(rf.predict(X_test_imp))
+        # print(f"  [{target}] RF Trained.")
+        # _record_importance(raw_feature_importances, norm_feature_importances, target, "RF", rf.feature_importances_)
 
-        et = ExtraTreesRegressor(**ET_PARAMS)
-        et.fit(X_train_use, y_train_use, sample_weight=sw_use)
-        preds.append(et.predict(X_test_imp))
-        print(f"  [{target}] ET Trained.")
-        _record_importance(raw_feature_importances, norm_feature_importances, target, "ET", et.feature_importances_)
-        test_baseline = X_test_imp[BASELINE_COL[target]]
+        # et = ExtraTreesRegressor(**ET_PARAMS)
+        # et.fit(X_train_use, y_train_use, sample_weight=sw_use)
+        # preds.append(et.predict(X_test_imp))
+        # print(f"  [{target}] ET Trained.")
+        # _record_importance(raw_feature_importances, norm_feature_importances, target, "ET", et.feature_importances_)
 
         # 그룹별 워밍업 값 (직전 그리드서치/Optuna 최고 기록을 시작점으로)
         warm_start = BEST_LOSS_CONFIG.get(target, {})
@@ -332,17 +365,25 @@ def train_ensemble(train_df, X_train, X_test, sample_sub):
         lgb_warm = {warm_start.get("LGBM", {}).get("loss_name"): warm_start.get("LGBM", {}).get("params")} if "LGBM" in warm_start else None
 
         print(f"  [{target}] XGB - Optuna 탐색 중...")
-        best_xgb = _run_optuna_search("XGB", target, capacity, lgbm_params, X_tr, y_tr, sw_tr, X_val, y_val, search_log,
-                                       baseline_tr, baseline_val, warm_start=xgb_warm)
-        preds.append(best_xgb["model"].predict(X_test_imp, base_margin=test_baseline))
+        best_xgb = _run_optuna_search("XGB", target, capacity, lgbm_params, X_tr, y_tr, sw_tr, X_val, y_val, search_log, warm_start=xgb_warm)
+        preds.append(best_xgb["model"].predict(X_test_imp))
+        diagnose_ficr_boundary(
+            y_val.values, best_xgb["model"].predict(X_val), capacity, target=target, model_name="XGB",
+            wind_speed=X_val["ws117_ldaps_spatial_mean"] if "ws117_ldaps_spatial_mean" in X_val.columns else None,
+            save_dir=OUTPUT_DIR,
+        )
         final_selection_log.append({"target": target, "model": "XGB", "loss_name": best_xgb["loss_name"],
                                      "params": str(best_xgb["params"]), "val_ficr": best_xgb["val_ficr"]})
         _record_importance(raw_feature_importances, norm_feature_importances, target, "XGB", best_xgb["model"].feature_importances_)
 
         print(f"  [{target}] LGBM - Optuna 탐색 중...")
-        best_lgb = _run_optuna_search("LGBM", target, capacity, lgbm_params, X_tr, y_tr, sw_tr, X_val, y_val, search_log,
-                                       baseline_tr, baseline_val, warm_start=lgb_warm)
-        preds.append(best_lgb["model"].predict(X_test_imp) + test_baseline.to_numpy())
+        best_lgb = _run_optuna_search("LGBM", target, capacity, lgbm_params, X_tr, y_tr, sw_tr, X_val, y_val, search_log, warm_start=lgb_warm)
+        preds.append(best_lgb["model"].predict(X_test_imp))
+        diagnose_ficr_boundary(
+            y_val.values, best_lgb["model"].predict(X_val), capacity, target=target, model_name="LGBM",
+            wind_speed=X_val["ws117_ldaps_spatial_mean"] if "ws117_ldaps_spatial_mean" in X_val.columns else None,
+            save_dir=OUTPUT_DIR,
+        )
         final_selection_log.append({"target": target, "model": "LGBM", "loss_name": best_lgb["loss_name"],
                                      "params": str(best_lgb["params"]), "val_ficr": best_lgb["val_ficr"]})
         imp_vals = best_lgb["model"].feature_importances_
@@ -350,6 +391,8 @@ def train_ensemble(train_df, X_train, X_test, sample_sub):
             imp_vals = imp_vals / imp_vals.sum()
         _record_importance(raw_feature_importances, norm_feature_importances, target, "LGBM", imp_vals)
 
+        # ensemble_preds[target] = np.clip(np.mean(preds, axis=0), 0, capacity)  # [기존] RF/ET/XGB/LGBM 단순 평균
+        print(f"  [{target}] Ensemble: XGB+LGBM only (RF/ET excluded)")
         ensemble_preds[target] = np.clip(np.mean(preds, axis=0), 0, capacity)
 
     raw_feature_importances['mean_importance_norm'] = norm_feature_importances.mean(axis=1)
@@ -392,45 +435,62 @@ def train_ensemble_final(train_df, X_train, X_test, sample_sub):
 
     for target in TARGET_COLS:
         capacity = CAPACITY_KWH[target]
-        X_train_use, y_train_use, sw_use, X_tr, y_tr, sw_tr, X_val, y_val, baseline_tr, baseline_val = _split_group_data(
+        X_train_use, y_train_use, sw_use, X_tr, y_tr, sw_tr, X_val, y_val = _split_group_data(
             train_df, X_train_imp, target, capacity
         )
 
+
         preds = []
+        val_preds = []  # [신규] 앙상블 가중치 최적화용 검증셋 예측값
 
-        rf = RandomForestRegressor(**RF_PARAMS)
-        rf.fit(X_train_use, y_train_use, sample_weight=sw_use)
-        preds.append(rf.predict(X_test_imp))
-        print(f"  [{target}] RF Trained.")
-        _record_importance(raw_feature_importances, norm_feature_importances, target, "RF", rf.feature_importances_)
+        # rf = RandomForestRegressor(**RF_PARAMS)
+        # rf.fit(X_train_use, y_train_use, sample_weight=sw_use)
+        # preds.append(rf.predict(X_test_imp))
+        # val_preds.append(rf.predict(X_val))  # [신규]
+        # print(f"  [{target}] RF Trained.")
+        # _record_importance(raw_feature_importances, norm_feature_importances, target, "RF", rf.feature_importances_)
 
-        et = ExtraTreesRegressor(**ET_PARAMS)
-        et.fit(X_train_use, y_train_use, sample_weight=sw_use)
-        preds.append(et.predict(X_test_imp))
-        print(f"  [{target}] ET Trained.")
-        _record_importance(raw_feature_importances, norm_feature_importances, target, "ET", et.feature_importances_)
-        test_baseline = X_test_imp[BASELINE_COL[target]]
+        # et = ExtraTreesRegressor(**ET_PARAMS)
+        # et.fit(X_train_use, y_train_use, sample_weight=sw_use)
+        # preds.append(et.predict(X_test_imp))
+        # val_preds.append(et.predict(X_val))  # [신규]
+        # print(f"  [{target}] ET Trained.")
+        # _record_importance(raw_feature_importances, norm_feature_importances, target, "ET", et.feature_importances_)
 
+       
         cfg = BEST_LOSS_CONFIG[target]
+        model_cfg = BEST_MODEL_CONFIG.get(target, {})  # [신규]
 
         xgb_cfg = cfg["XGB"]
+        xgb_model_params = model_cfg.get("XGB") or None  # [신규] 비어있으면 None -> 기존 XGB_PARAMS 사용
         best_xgb, xgb_val_ficr = _fit_xgb_with_params(
-            xgb_cfg["loss_name"], xgb_cfg["params"], X_tr, y_tr, sw_tr, X_val, y_val, capacity,
-            baseline_tr, baseline_val
+            xgb_cfg["loss_name"], xgb_cfg["params"], X_tr, y_tr, sw_tr, X_val, y_val, capacity, xgb_model_params
         )
-        preds.append(best_xgb.predict(X_test_imp, base_margin=test_baseline))
+        preds.append(best_xgb.predict(X_test_imp))
+        val_preds.append(best_xgb.predict(X_val))  # [신규]
         print(f"  [{target}] XGB Trained. loss={xgb_cfg['loss_name']} params={xgb_cfg['params']} val_ficr={xgb_val_ficr:.4f}")
+        diagnose_ficr_boundary(
+            y_val.values, best_xgb.predict(X_val), capacity, target=target, model_name="XGB",
+            wind_speed=X_val["ws117_ldaps_spatial_mean"] if "ws117_ldaps_spatial_mean" in X_val.columns else None,
+            save_dir=OUTPUT_DIR,
+        )
         final_used_log.append({"target": target, "model": "XGB", "loss_name": xgb_cfg["loss_name"],
                                 "params": str(xgb_cfg["params"]), "val_ficr": xgb_val_ficr})
         _record_importance(raw_feature_importances, norm_feature_importances, target, "XGB", best_xgb.feature_importances_)
 
         lgb_cfg = cfg["LGBM"]
+        lgb_model_params = {**lgbm_params, **model_cfg.get("LGBM", {})}  # [신규] 있으면 덮어쓰기, 없으면 기존 lgbm_params 그대로
         best_lgb, lgb_val_ficr = _fit_lgbm_with_params(
-            lgb_cfg["loss_name"], lgb_cfg["params"], lgbm_params, X_tr, y_tr, sw_tr, X_val, y_val, capacity,
-            baseline_tr, baseline_val
+            lgb_cfg["loss_name"], lgb_cfg["params"], lgb_model_params, X_tr, y_tr, sw_tr, X_val, y_val, capacity
         )
-        preds.append(best_lgb.predict(X_test_imp) + test_baseline.to_numpy())
+        preds.append(best_lgb.predict(X_test_imp))
+        val_preds.append(best_lgb.predict(X_val))  # [신규]
         print(f"  [{target}] LGBM Trained. loss={lgb_cfg['loss_name']} params={lgb_cfg['params']} val_ficr={lgb_val_ficr:.4f}")
+        diagnose_ficr_boundary(
+            y_val.values, best_lgb.predict(X_val), capacity, target=target, model_name="LGBM",
+            wind_speed=X_val["ws117_ldaps_spatial_mean"] if "ws117_ldaps_spatial_mean" in X_val.columns else None,
+            save_dir=OUTPUT_DIR,
+        )
         final_used_log.append({"target": target, "model": "LGBM", "loss_name": lgb_cfg["loss_name"],
                                 "params": str(lgb_cfg["params"]), "val_ficr": lgb_val_ficr})
         imp_vals = best_lgb.feature_importances_
@@ -438,6 +498,14 @@ def train_ensemble_final(train_df, X_train, X_test, sample_sub):
             imp_vals = imp_vals / imp_vals.sum()
         _record_importance(raw_feature_importances, norm_feature_importances, target, "LGBM", imp_vals)
 
+        # ensemble_preds[target] = np.clip(np.mean(preds, axis=0), 0, capacity)
+        # [신규] 검증셋 FICR 최대화 가중치로 앙상블
+        # weights = _optimize_ensemble_weights(val_preds, y_val.values, capacity)
+        # print(f"  [{target}] Ensemble weights (RF/ET/XGB/LGBM): {np.round(weights, 3)}")
+        # weighted_pred = np.average(preds, axis=0, weights=weights)
+        # ensemble_preds[target] = np.clip(weighted_pred, 0, capacity)
+        # [신규] RF/ET 제외, XGB+LGBM만 단순 평균
+        print(f"  [{target}] Ensemble: XGB+LGBM only (RF/ET excluded)")
         ensemble_preds[target] = np.clip(np.mean(preds, axis=0), 0, capacity)
 
     raw_feature_importances['mean_importance_norm'] = norm_feature_importances.mean(axis=1)
@@ -455,6 +523,69 @@ def train_ensemble_final(train_df, X_train, X_test, sample_sub):
     print(final_log_df.to_string(index=False))
 
     return ensemble_preds
+
+### 발전량 확인용
+def diagnose_ficr_boundary(y_true, y_pred, capacity, target, model_name, wind_speed=None, save_dir=None):
+    """
+    검증셋 예측/실제값의 오차율을 6%/8% 경계선 기준으로 진단.
+    - error_rate 히스토그램 (6%/8% 경계선 표시)
+    - 가격 구간(4원/3원/0원)별 표본 수·비중
+    - (wind_speed 제공 시) 풍속 구간별로 '경계선 바로 바깥(0원대)' 비중이 몰리는지 확인
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    valid = y_true >= capacity * VALID_RATIO_THRESHOLD
+    error_rate = np.abs(y_pred[valid] - y_true[valid]) / capacity
+
+    # 1) 가격 구간별 집계
+    tier = np.select(
+        [error_rate <= 0.06, error_rate <= 0.08, error_rate > 0.08],
+        ["4원 (~6%)", "3원 (6~8%)", "0원 (8%초과)"],
+        default="Unknown"
+    )
+    tier_counts = pd.Series(tier).value_counts()
+    tier_ratio = (tier_counts / len(tier) * 100).round(1)
+    print(f"\n[{target}][{model_name}] Price tier distribution {valid.sum()}행 기준 가격 구간별 분포")
+    print(pd.DataFrame({"count": tier_counts, "ratio(%)": tier_ratio}))
+
+    # 2) '경계선 바로 바깥'에 몰려있는지 확인 (6~7%, 8~9% vs 그 외)
+    near_6 = ((error_rate > 0.06) & (error_rate <= 0.07)).sum()
+    near_8 = ((error_rate > 0.08) & (error_rate <= 0.09)).sum()
+    total_over_6 = (error_rate > 0.06).sum()
+    total_over_8 = (error_rate > 0.08).sum()
+    print(f"  6% 초과 중 6~7%(경계선 바로 바깥) 비중: "
+          f"{near_6}/{total_over_6} ({100*near_6/max(total_over_6,1):.1f}%)")
+    print(f"  8% 초과 중 8~9%(경계선 바로 바깥) 비중: "
+          f"{near_8}/{total_over_8} ({100*near_8/max(total_over_8,1):.1f}%)")
+
+    # 3) 히스토그램 (6%/8% 경계선 표시)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.hist(error_rate, bins=60, alpha=0.7)
+    ax.axvline(0.06, color="red", linestyle="--", label="6% boundary")
+    ax.axvline(0.08, color="orange", linestyle="--", label="8% boundary")
+    ax.set_xlabel("error_rate = |pred-true| / capacity")
+    ax.set_ylabel("count")
+    ax.set_title(f"{target} - {model_name} Error Rate Distribution (validation)")
+    ax.legend()
+    if save_dir:
+        fig.savefig(save_dir / f"ficr_boundary_{target}_{model_name}.png", dpi=100, bbox_inches="tight")
+    plt.close(fig)
+
+    # 4) (선택) 풍속 구간별 '0원대(8% 초과)' 비중 - 어느 풍속대에서 몰리는지 확인
+    if wind_speed is not None:
+        wind_speed = np.asarray(wind_speed)[valid]
+        ws_bin = np.floor(wind_speed / 1.0)  # 1 m/s 단위로 뭉뚱그려서 확인
+        df_ws = pd.DataFrame({"ws_bin": ws_bin, "error_rate": error_rate})
+        df_ws["zero_price"] = df_ws["error_rate"] > 0.08
+        by_ws = df_ws.groupby("ws_bin").agg(
+            n=("error_rate", "size"),
+            zero_price_ratio=("zero_price", "mean"),
+        )
+        by_ws = by_ws[by_ws["n"] >= 10]  # 표본 너무 적은 구간 제외
+        print(f"\n  풍속(m/s) 구간별 0원 처리 비중 (표본 10개 이상만):")
+        print(by_ws.sort_values("zero_price_ratio", ascending=False).head(10))
+
+    return error_rate
 
 
 def main():

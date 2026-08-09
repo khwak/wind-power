@@ -1,13 +1,15 @@
 # ==========================================
-# 1. Data & Large Files (대용량 데이터 제외)
+# 1. Data & Large Files
 # ==========================================
+
 data/
 *.parquet
 *.csv
 
 # ==========================================
-# 2. Output & Logs (제출물, 시각화, 로그 제외)
+# 2. Output & Logs
 # ==========================================
+
 outputs/
 *.log
 *.png
@@ -15,8 +17,9 @@ outputs/
 *.jpeg
 
 # ==========================================
-# 3. Model Checkpoints & Weights (모델 가중치 제외)
+# 3. Model Checkpoints & Weights
 # ==========================================
+
 models/
 scripts/AutogluonModels/
 *.pkl
@@ -25,8 +28,9 @@ scripts/AutogluonModels/
 *.bin
 
 # ==========================================
-# 4. Python & Environment (파이썬 임시 파일 제외)
+# 4. Python Cache & Temporary Files
 # ==========================================
+
 __pycache__/
 *.py[cod]
 *$py.class
@@ -35,8 +39,9 @@ __pycache__/
 htmlcov/
 
 # ==========================================
-# 5. Virtual Environment & IDE (가상환경 및 IDE 제외)
+# 5. Virtual Environment & IDE
 # ==========================================
+
 .venv/
 venv/
 ENV/
@@ -47,4 +52,13 @@ ENV/
 # ==========================================
 # 6. Jupyter Notebook Checkpoints
 # ==========================================
+
 .ipynb_checkpoints/
+
+# ==========================================
+# 7. Environment / Secrets
+# ==========================================
+
+.env
+.env.*
+!.env.example
