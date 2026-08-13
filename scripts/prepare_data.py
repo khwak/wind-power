@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import json
 import re
 from pathlib import Path
 from typing import Iterable
@@ -10,6 +10,7 @@ import pandas as pd
 from config import (
     RAW_DIR, TARGET_COLS, GRID_SELECTION_METHOD, GRID_MANUAL_SELECTION,
     SHEAR_BIAS_CORRECTION, GRID_DIFF_PAIRS, EXCLUDED_FEATURES,
+    MODEL_DIR, SHEAR_MIN_SEASON_SAMPLES,
 )
 
 HUB_HEIGHT_M = 117.0
@@ -199,7 +200,8 @@ def diagnose_grid_correlation(
             subset=["ws117_power_ldaps", target_col]
         )
         corr = merged.groupby("grid_id").apply(
-            lambda g: g["ws117_power_ldaps"].corr(g[target_col])
+            lambda g: g["ws117_power_ldaps"].corr(g[target_col]),
+            include_groups=False
         ).sort_values(ascending=False)
         corr_df = corr.reset_index()
         corr_df.columns = ["grid_id", "correlation"]
@@ -747,9 +749,10 @@ def fit_group_shear_calibration(
     scada_vestas_fit: pd.DataFrame,
     scada_unison_fit: pd.DataFrame,
     cutoff: pd.Timestamp,
+    months: list[int] | None = None,  # [신규] 계절별 보정용 월 필터
 ) -> pd.DataFrame:
     """cutoff 이전 구간에서 그룹 대표 격자의 ws117과 SCADA 실측(시간평균)을 매칭해
-    shear 보정 룩업을 학습한다. (진단 스크립트와 동일한 시간 정합 방식)"""
+    shear 보정 룩업을 학습한다. months가 주어지면 그 달들만 필터링한다."""
     ldaps_g = ldaps_train_grid[
         (ldaps_train_grid["grid_id"] == grid_id)
         & (ldaps_train_grid["forecast_kst_dtm"] < cutoff)
@@ -765,7 +768,71 @@ def fit_group_shear_calibration(
     scada_hourly = scada_hourly.groupby("forecast_kst_dtm")["scada_ws_mean"].mean().reset_index()
 
     merged = ldaps_g.merge(scada_hourly, on="forecast_kst_dtm", how="inner").dropna()
+    if months is not None:  # [신규]
+        merged = merged[merged["forecast_kst_dtm"].dt.month.isin(months)]
     return fit_shear_calibration_lookup(merged["ws117_power_ldaps"], merged["scada_ws_mean"])
+
+
+def fit_group_shear_calibration_seasonal(
+    group: int,
+    meta: dict,
+    ldaps_train_grid: pd.DataFrame,
+    grid_id: int,
+    scada_vestas_fit: pd.DataFrame,
+    scada_unison_fit: pd.DataFrame,
+    cutoff: pd.Timestamp,
+    season_months: dict[str, list[int]],
+    min_season_samples: int = SHEAR_MIN_SEASON_SAMPLES,
+) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    """계절 클러스터(regime 발견에 쓰던 seasonal_clusters.json과 동일 클러스터)별로
+    shear 보정 룩업을 따로 학습한다. 표본 부족한 계절은 그룹 전체(글로벌) 룩업으로 자동 폴백한다."""
+    global_lookup = fit_group_shear_calibration(
+        group, meta, ldaps_train_grid, grid_id, scada_vestas_fit, scada_unison_fit, cutoff,
+    )
+    season_lookups: dict[str, pd.DataFrame] = {}
+    for season_name, months in season_months.items():
+        try:
+            lk = fit_group_shear_calibration(
+                group, meta, ldaps_train_grid, grid_id, scada_vestas_fit, scada_unison_fit, cutoff,
+                months=months,
+            )
+            total_count = int(lk["count"].sum())
+            if total_count < min_season_samples:
+                print(f"  [group{group}] {season_name}{months} shear 보정 표본 부족({total_count}) -> 글로벌 폴백")
+                season_lookups[season_name] = global_lookup
+            else:
+                season_lookups[season_name] = lk
+        except ValueError:
+            print(f"  [group{group}] {season_name}{months} shear 보정 실패 -> 글로벌 폴백")
+            season_lookups[season_name] = global_lookup
+    return season_lookups, global_lookup
+
+
+def apply_shear_calibration_seasonal(
+    wind_speed,
+    forecast_kst_dtm,
+    season_lookups: dict[str, pd.DataFrame],
+    global_lookup: pd.DataFrame,
+    group_clusters: dict[str, list[int]],
+) -> np.ndarray:
+    """행의 월(forecast_kst_dtm)로 계절을 찾아 해당 계절 전용 룩업으로 보정한다.
+    어느 클러스터에도 안 걸리는 달은 글로벌 룩업으로 처리한다."""
+    ws = np.asarray(wind_speed, dtype=float)
+    months = pd.to_datetime(forecast_kst_dtm).dt.month.to_numpy()
+    result = np.full(len(ws), np.nan, dtype=float)
+    assigned = np.zeros(len(ws), dtype=bool)
+
+    for season_name, season_months in group_clusters.items():
+        mask = np.isin(months, season_months) & (~assigned)
+        if not mask.any():
+            continue
+        lookup = season_lookups.get(season_name, global_lookup)
+        result[mask] = apply_shear_calibration_lookup(ws[mask], lookup)
+        assigned |= mask
+
+    if (~assigned).any():
+        result[~assigned] = apply_shear_calibration_lookup(ws[~assigned], global_lookup)
+    return result
 
 
 def apply_power_curve_lookup(
@@ -874,7 +941,8 @@ def _apply_scada_proxy_features(
     group_grids: dict[int, int],
     power_lookups: dict[int, pd.DataFrame],
     variability_lookups: dict[int, pd.DataFrame],
-    shear_calibration_lookups: dict[int, pd.DataFrame],  # [신규]
+    shear_season_lookups: dict[int, tuple[dict[str, pd.DataFrame], pd.DataFrame]],  # [신규] group -> (season_lookups, global_lookup)
+    seasonal_clusters: dict[str, dict[str, list[int]]],  # [신규] "kpx_group_N" -> {season_name: months}
 ) -> pd.DataFrame:
     out = frame.copy()
 
@@ -888,9 +956,17 @@ def _apply_scada_proxy_features(
                 f"그룹 {group} 대표 grid={grid_id} 피처가 없습니다: {ws_col}, {wd_col}"
             )
 
-        # [신규] 선형 보정 대신 비선형 룩업 보정 적용
-        calibrated_ws = apply_shear_calibration_lookup(out[ws_col], shear_calibration_lookups[group])
-        out[f"ws117_calibrated_group{group}"] = calibrated_ws  # [신규] 모델이 직접 쓸 수 있는 feature로도 보존
+        season_lookups, global_lookup = shear_season_lookups[group]
+        group_clusters = seasonal_clusters.get(f"kpx_group_{group}", {})
+
+        if group_clusters:
+            calibrated_ws = apply_shear_calibration_seasonal(
+                out[ws_col], out["forecast_kst_dtm"], season_lookups, global_lookup, group_clusters,
+            )
+        else:
+            calibrated_ws = apply_shear_calibration_lookup(out[ws_col], global_lookup)
+
+        out[f"ws117_calibrated_group{group}"] = calibrated_ws
 
         out[meta["power_feature"]] = apply_power_curve_lookup(
             calibrated_ws,
@@ -1104,9 +1180,16 @@ def get_tabular_data(
     }
     print(f"그룹별 대표 격자 선택({GRID_SELECTION_METHOD}): {group_grids}")
 
+    try:  # [신규] regime 발견 때 쓰던 것과 동일 클러스터 재사용
+        with open(MODEL_DIR / "seasonal_clusters.json", "r", encoding="utf-8") as f:
+            seasonal_clusters = json.load(f)
+    except FileNotFoundError:
+        seasonal_clusters = {}
+        print("[경고] seasonal_clusters.json 없음 -> shear 보정은 그룹 전체(글로벌) 기준으로만 동작합니다.")
+
     power_lookups: dict[int, pd.DataFrame] = {}
     variability_lookups: dict[int, pd.DataFrame] = {}
-    shear_calibration_lookups: dict[int, pd.DataFrame] = {}  # [신규]
+    shear_season_lookups: dict[int, tuple] = {}  # [신규]
 
     for group, meta in GROUP_META.items():
         scada_source = (
@@ -1123,10 +1206,19 @@ def get_tabular_data(
             scada_source,
             turbines,
         )
-        shear_calibration_lookups[group] = fit_group_shear_calibration(  # [신규]
-            group, meta, ldaps_train_grid, group_grids[group],
-            scada_vestas_fit, scada_unison_fit, cutoff,
-        )
+
+        group_clusters = seasonal_clusters.get(f"kpx_group_{group}", {})
+        if group_clusters:  # [신규] 계절별 학습, 없으면 기존 방식(글로벌만)
+            shear_season_lookups[group] = fit_group_shear_calibration_seasonal(
+                group, meta, ldaps_train_grid, group_grids[group],
+                scada_vestas_fit, scada_unison_fit, cutoff, group_clusters,
+            )
+        else:
+            gl = fit_group_shear_calibration(
+                group, meta, ldaps_train_grid, group_grids[group],
+                scada_vestas_fit, scada_unison_fit, cutoff,
+            )
+            shear_season_lookups[group] = ({}, gl)
 
     train_base = labels_used.rename(columns={"kst_dtm": "forecast_kst_dtm"})
     train_df = train_base.merge(
@@ -1147,14 +1239,16 @@ def get_tabular_data(
         group_grids,
         power_lookups,
         variability_lookups,
-        shear_calibration_lookups,
+        shear_season_lookups,
+        seasonal_clusters,
     )
     test_df = _apply_scada_proxy_features(
         test_df,
         group_grids,
         power_lookups,
         variability_lookups,
-        shear_calibration_lookups, 
+        shear_season_lookups,
+        seasonal_clusters,
     )
 
     # 검증 때 반드시 사용할 명시적 마스크. purge gap은 두 마스크 모두 False다.

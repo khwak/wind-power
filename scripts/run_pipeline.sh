@@ -8,7 +8,7 @@ conda activate wind
 
 # 실행 모드 설정 (chronos, ensemble, chronos_ensemble 중 택 1)
 # 'autogluon', 'ensemble', 'ag_ensemble'
-# 'final', 'search'
+# 'final', 'search', 'quantile'
 MODE="final"
 
 echo "=== [1/4] prepare_data.py 시작: $(date) ==="

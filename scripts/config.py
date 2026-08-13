@@ -59,16 +59,16 @@ CV_WINDOW_DAYS = 90  # fold 하나가 담당하는 검증 구간 길이 (~한 �
 # 여기 중요도가 안 잡힌다. ws117_cube_ldaps, wind_energy_flux_ldaps는 트리 중요도는 낮지만
 # Ridge가 3승 물리관계를 선형으로 근사하는 데 구조적으로 의존하는 feature라 절대 제외하지 않는다.
 EXCLUDED_FEATURES = [
-    "ldaps_missing_flag",           # 전체 0 — 결측 사실상 없음
-    "alpha_fallback_fraction",      # 사실상 0 — 외삽 실패 fallback 거의 없음
-    "gfs_calm_wind_flag_gfs_mean",  # 연속형 ws10_gfs와 정보 중복
-    "is_weekend",                   # 풍력발전과 물리적 무관, 중요도 거의 0
-    # 아래 셋은 트리 중요도 기준으로는 낮으나, curve 모델 영향은 미확인 상태다.
-    # 반영 후 hyperparam-val 및 evaluate.py 점수를 반드시 재확인할 것.
-    "vestas_power_variability_group1",
-    "vestas_power_variability_group2",
-    "unison_power_variability",
-    "ws117_diff_1h_ldaps",
+    # LDAPS 격자별 풍향(wd117)
+    "wd117_ldaps_grid_1", "wd117_ldaps_grid_2", "wd117_ldaps_grid_3", "wd117_ldaps_grid_4",
+    "wd117_ldaps_grid_5", "wd117_ldaps_grid_6", "wd117_ldaps_grid_7", "wd117_ldaps_grid_8",
+    "wd117_ldaps_grid_9", "wd117_ldaps_grid_10", "wd117_ldaps_grid_11", "wd117_ldaps_grid_12",
+    "wd117_ldaps_grid_13", "wd117_ldaps_grid_14", "wd117_ldaps_grid_15", "wd117_ldaps_grid_16",
+    # LDAPS 격자별 풍속(ws117)
+    "ws117_ldaps_grid_1", "ws117_ldaps_grid_2", "ws117_ldaps_grid_3", "ws117_ldaps_grid_4",
+    "ws117_ldaps_grid_5", "ws117_ldaps_grid_6", "ws117_ldaps_grid_7", "ws117_ldaps_grid_8",
+    "ws117_ldaps_grid_10", "ws117_ldaps_grid_11", "ws117_ldaps_grid_12",
+    "ws117_ldaps_grid_14", "ws117_ldaps_grid_15", "ws117_ldaps_grid_16",
 ]
 
 
@@ -79,7 +79,7 @@ VALID_RATIO_THRESHOLD = 0.10
 EXCLUDE_INVALID_ROWS = True     
 INVALID_SAMPLE_WEIGHT = 0.1     
 VAL_HOLDOUT_RATIO = 0.10        
-EARLY_STOPPING_ROUNDS = 100
+EARLY_STOPPING_ROUNDS = 50
 
 # Ensemble 하이퍼파라미터
 RF_PARAMS = {
@@ -108,18 +108,19 @@ XGB_PARAMS = {
 }
 
 LGBM_PARAMS = {
-    "n_estimators": 300,
+    "n_estimators": 600,
     "learning_rate": 0.05,
     "num_leaves": 31,
     "subsample": 0.8,
     "colsample_bytree": 0.8,
     "random_state": 42,
     "min_child_weight": 1.0,   
-    "reg_lambda": 1.0,         
+    "reg_lambda": 1.0,   
+    "verbosity": -1,      
 }
 
 # 손실함수 커스텀 설정
-LOSS_TYPES = ["huber_capacity", "threshold_weighted", "smooth_ficr"]
+LOSS_TYPES = ["huber_capacity", "threshold_weighted", "smooth_ficr", "threshold_weighted_huber"]
 LOSS_PARAM_GRIDS = {
     "huber_capacity": [
         {"delta": d} for d in [0.02, 0.03, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15]
@@ -143,11 +144,18 @@ REGIME_CONFIG_PATH = MODEL_DIR / "regime_config.json"
 
 # discover_regimes.py 전용 설정
 REGIME_WS_BIN_WIDTH = 1.0
-REGIME_MIN_BIN_SAMPLES = 100         # bin 하나를 신뢰하기 위한 (fold 합산) 최소 표본
-REGIME_MIN_FOLD_BIN_SAMPLES = 30     # fold-bin 조합 하나를 신뢰하기 위한 최소 표본
-REGIME_MIN_FOLD_AGREE_RATIO = 0.75   # 이 비율 이상 fold가 같은 모델을 가리켜야 "확정 구간"
-REGIME_MIN_WIDTH = 2.0               # 확정 구간 최소 폭(m/s), 미만이면 노이즈로 보고 블렌딩 처리
-
+REGIME_MIN_BIN_SAMPLES = 100         
+REGIME_MIN_FOLD_BIN_SAMPLES = 30    
+REGIME_MIN_FOLD_AGREE_RATIO = {
+    "kpx_group_1": 0.75,
+    "kpx_group_2": 0.75,
+    "kpx_group_3": 0.5,   
+}  
+REGIME_MIN_WIDTH = {
+    "kpx_group_1": 2.0,
+    "kpx_group_2": 2.0,
+    "kpx_group_3": 1.0,   
+}
 RIDGE_PARAMS = {"alpha": 1.0, "random_state": 42}
 
 MLP_PARAMS = {
@@ -218,11 +226,11 @@ WS_FEATURE_COL = {
 # regime_config.json에서 확인된 그룹별 램프구간
 # (잠정치, WS_FEATURE_COL 기준 — 격자 선택 방식이 바뀌면 재확인 필요)
 RAMP_WS_RANGES = {
-    "kpx_group_1": (14.0, 16.0),
-    "kpx_group_2": (14.0, 16.0),
-    # "kpx_group_3": (9.0, 20.0),
+    "kpx_group_1": (6.0, 12.0),  
+    "kpx_group_2": (6.0, 12.0),  
+    "kpx_group_3": (6.0, 12.5),  
 }
-RAMP_SAMPLE_WEIGHT = 2.0  # 램프구간 표본에 곱할 가중치 배수. 처음엔 보수적으로 2.0부터
+RAMP_SAMPLE_WEIGHT = 3.5  # 램프구간 표본에 곱할 가중치 배수. 처음엔 보수적으로 2.0부터
 
 
 ##### 격자 선택 & shear 보정 (팀원 분석 반영용) #####
@@ -238,15 +246,51 @@ GRID_MANUAL_SELECTION = {1: 13, 2: 13, 3: 13}
 
 # 그룹별 shear 외삽 보정. {group: {"scale": a, "offset": b}} 형태.
 # 비어있으면(={}) 보정 미적용 = 기존 동작과 100% 동일.
-# ws117_corrected = ws117_원본 * scale + offset
-# 팀원 shear 분석 결과가 나오면 이 딕셔너리만 채우면 됨. 예:
-# SHEAR_BIAS_CORRECTION = {1: {"scale": 1.05, "offset": -0.3}, 2: {...}, 3: {...}}
 SHEAR_BIAS_CORRECTION = {}
+# 계절별 shear 보정 — 계절 클러스터(seasonal_clusters.json) 하나당 최소 표본 수.
+
+SHEAR_MIN_SEASON_SAMPLES = 300
 
 ##### 격자 간 gradient feature #####
 # partial correlation 분석(grid13 통제 후 편상관) 결과 상위였던 쌍부터 우선 반영
 # 각 튜플은 (a, b) → 새 feature명: ws117_ldaps_diff_{a}_{b} = grid_a - grid_b
 GRID_DIFF_PAIRS = [(13, 9)]
+
+
+##### 분위수 기반 전략적 예측 (GEFCom2014 winner 방식) #####
+QUANTILE_LEVELS = [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
+QUANTILE_CALIBRATION_RATIO = 0.20  # X_tr 꼬리에서 보정용 비율
+
+# 기대정산금 최대화 탐색 시 후보값 격자 설정
+QUANTILE_SEARCH_MARGIN_RATIO = 0.08   # min/max 분위수 예측값 양옆으로 이만큼(비율) 더 넓게 탐색
+QUANTILE_SEARCH_N_CANDIDATES = 121    # 후보값 개수 (많을수록 정밀, 느려짐)
+
+LGBM_QUANTILE_PARAMS = {
+    "n_estimators": 1500,       
+    "learning_rate": 0.02,       
+    "num_leaves": 15,
+    "max_depth": 4,
+    "min_child_samples": 50,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "random_state": 42,
+    "min_child_weight": 1.0,
+    "reg_lambda": 1.0,
+    "verbosity": -1,
+}
+
+XGB_QUANTILE_PARAMS = {
+    "n_estimators": 1500,        
+    "learning_rate": 0.02,       
+    "max_depth": 4,
+    "min_child_weight": 10,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "random_state": 42,
+    "n_jobs": -1,
+}
+
+
 
 
 ###### Optuna 하이퍼파라미터 #####
@@ -257,7 +301,9 @@ HUBER_HESS_FLOOR = 1e-2
 
 # 다중 fold Optuna 탐색용 trial 예산 
 # SEASONAL_OPTUNA_TRIAL_BUDGET = {"huber_capacity": 10, "threshold_weighted": 15, "smooth_ficr": 15}
-SEASONAL_OPTUNA_TRIAL_BUDGET = {"huber_capacity": 10, "threshold_weighted": 15}
+# SEASONAL_OPTUNA_TRIAL_BUDGET = {"huber_capacity": 10, "threshold_weighted": 15}
+# SEASONAL_OPTUNA_TRIAL_BUDGET = {"huber_capacity": 10, "threshold_weighted": 10, "threshold_weighted_huber": 20}
+SEASONAL_OPTUNA_TRIAL_BUDGET = {"huber_capacity": 15, "threshold_weighted": 25, "huber_threshold": 25}
 
 # 손실함수 탐색 공간
 OPTUNA_SEARCH_SPACE = {
@@ -272,7 +318,19 @@ OPTUNA_SEARCH_SPACE = {
         "anchor_weight": {"low": 0.5, "high": 0.95, "log": False},  # 0.1~0.999 → 0.5~0.95
         "k": {"low": 50, "high": 800, "log": True},
     },
+    "threshold_weighted_huber": {
+        "delta": {"low": 0.05, "high": 0.30, "log": True},
+        "amplitude": {"low": 0.5, "high": 10.0, "log": True},
+        "sigma": {"low": 0.002, "high": 0.03, "log": True},
+    },
+    "huber_threshold": {                                   
+        "delta": {"low": 0.05, "high": 0.30, "log": True},   
+        "amplitude": {"low": 0.1, "high": 15.0, "log": True},
+        "sigma": {"low": 0.001, "high": 0.05, "log": True},
+    },
 }
+
+STABILITY_LAMBDA = 0.0
 
 # 모델 탐색 공간
 XGB_SEARCH_SPACE = {
@@ -285,7 +343,7 @@ XGB_SEARCH_SPACE = {
 }
 LGBM_SEARCH_SPACE = {
     "n_estimators": {"low": 100, "high": 800, "log": False, "type": "int"},
-    "num_leaves": {"low": 15, "high": 63, "log": False, "type": "int"},           # [개선] 127 -> 63 축소 (과적합 방지)
+    "num_leaves": {"low": 15, "high": 127, "log": False, "type": "int"},           # [개선] 127 -> 63 축소 (과적합 방지)
     "learning_rate": {"low": 0.01, "high": 0.08, "log": True, "type": "float"},   # [개선] 0.2 -> 0.08 축소
     "subsample": {"low": 0.6, "high": 1.0, "log": False, "type": "float"},
     "colsample_bytree": {"low": 0.5, "high": 1.0, "log": False, "type": "float"},
@@ -293,18 +351,34 @@ LGBM_SEARCH_SPACE = {
 }
 
 ##### final 버전 - 최적화 하드코딩 #####
+# BEST_MODEL_CONFIG = {
+#     "kpx_group_1": {
+#         "XGB":  {"random_state": 42, "n_jobs": -1, "n_estimators": 707, "max_depth": 6, "learning_rate": 0.04359666365651395, "subsample": 0.608233797718321, "colsample_bytree": 0.9849549260809971, "reg_lambda": 6.798962421591129},
+#         "LGBM": {"random_state": 42, "min_child_weight": 1.0, "verbosity": -1, "importance_type": "gain", "n_estimators": 711, "num_leaves": 64, "learning_rate": 0.0796367226999673, "subsample": 0.8509679306459871, "colsample_bytree": 0.666412081433084, "reg_lambda": 9.895615387708215},
+#     },
+#     "kpx_group_2": {
+#         "XGB":  {"random_state": 42, "n_jobs": -1, "n_estimators": 402, "max_depth": 4, "learning_rate": 0.035690959437712715, "subsample": 0.6557975442608167, "colsample_bytree": 0.6460723242676091, "reg_lambda": 2.324672848950434},
+#         "LGBM": {"random_state": 42, "min_child_weight": 1.0, "verbosity": -1, "importance_type": "gain", "n_estimators": 402, "num_leaves": 47, "learning_rate": 0.035690959437712715, "subsample": 0.6557975442608167, "colsample_bytree": 0.6460723242676091, "reg_lambda": 2.324672848950434},
+#     },
+#     "kpx_group_3": {
+#         "XGB":  {"random_state": 42, "n_jobs": -1, "n_estimators": 753, "max_depth": 6, "learning_rate": 0.034690153706107965, "subsample": 0.7691005300077898, "colsample_bytree": 0.7472234962527935, "reg_lambda": 1.2011881007835652},
+#         "LGBM": {"random_state": 42, "min_child_weight": 1.0, "verbosity": -1, "importance_type": "gain", "n_estimators": 317, "num_leaves": 51, "learning_rate": 0.04559319574629467, "subsample": 0.8550229885420852, "colsample_bytree": 0.9436063712881633, "reg_lambda": 2.9662989987000667},
+#     },
+# }
+
+# test
 BEST_MODEL_CONFIG = {
     "kpx_group_1": {
-        "XGB":  {"random_state": 42, "n_jobs": -1, "n_estimators": 707, "max_depth": 6, "learning_rate": 0.04359666365651395, "subsample": 0.608233797718321, "colsample_bytree": 0.9849549260809971, "reg_lambda": 6.798962421591129},
-        "LGBM": {"random_state": 42, "min_child_weight": 1.0, "importance_type": "gain", "n_estimators": 707, "num_leaves": 44, "learning_rate": 0.04359666365651395, "subsample": 0.608233797718321, "colsample_bytree": 0.9849549260809971, "reg_lambda": 6.798962421591129},
+        "XGB":  {"random_state": 42, "n_jobs": -1, "n_estimators": 499, "max_depth": 4, "learning_rate": 0.04195620299074925, "subsample": 0.7424364893339975, "colsample_bytree": 0.720932341890189, "reg_lambda": 4.542425989748594},
+        "LGBM": {"random_state": 42, "min_child_weight": 1.0, "verbosity": -1, "importance_type": "gain", "n_estimators": 660, "num_leaves": 68, "learning_rate": 0.059750451948554786, "subsample": 0.6023899357045669, "colsample_bytree": 0.8199638193192597, "reg_lambda": 2.9318471869411504},
     },
     "kpx_group_2": {
-        "XGB":  {"random_state": 42, "n_jobs": -1, "n_estimators": 237, "max_depth": 3, "learning_rate": 0.01966991866768146, "subsample": 0.7554709158757928, "colsample_bytree": 0.6356745158869479, "reg_lambda": 6.741204610702761},
-        "LGBM": {"random_state": 42, "min_child_weight": 1.0, "importance_type": "gain", "n_estimators": 313, "num_leaves": 19, "learning_rate": 0.04148814287315352, "subsample": 0.7760609974958406, "colsample_bytree": 0.5610191174223894, "reg_lambda": 3.1273530367803706},
+        "XGB":  {"random_state": 42, "n_jobs": -1, "n_estimators": 469, "max_depth": 5, "learning_rate": 0.06249944751725576, "subsample": 0.9031934126795159, "colsample_bytree": 0.7426604485466712, "reg_lambda": 1.0622600189983782},
+        "LGBM": {"random_state": 42, "min_child_weight": 1.0, "verbosity": -1, "importance_type": "gain", "n_estimators": 776, "num_leaves": 106, "learning_rate": 0.018840552955192824, "subsample": 0.6390688456025535, "colsample_bytree": 0.8421165132560784, "reg_lambda": 2.7551959649510764},
     },
     "kpx_group_3": {
-        "XGB":  {"random_state": 42, "n_jobs": -1, "n_estimators": 304, "max_depth": 4, "learning_rate": 0.025815006344207546, "subsample": 0.9140703845572055, "colsample_bytree": 0.5998368910791798, "reg_lambda": 3.2676417657817622},
-        "LGBM": {"random_state": 42, "min_child_weight": 1.0, "importance_type": "gain", "n_estimators": 666, "num_leaves": 29, "learning_rate": 0.01225199210177624, "subsample": 0.8736932106048627, "colsample_bytree": 0.7200762468698007, "reg_lambda": 1.324458134009935},
+        "XGB":  {"random_state": 42, "n_jobs": -1, "n_estimators": 228, "max_depth": 4, "learning_rate": 0.02977846306223348, "subsample": 0.7727780074568463, "colsample_bytree": 0.645614570099021, "reg_lambda": 4.091220574443785},
+        "LGBM": {"random_state": 42, "min_child_weight": 1.0, "verbosity": -1, "importance_type": "gain", "n_estimators": 448, "num_leaves": 33, "learning_rate": 0.04561487895116297, "subsample": 0.8468838671697153, "colsample_bytree": 0.728920203341694, "reg_lambda": 1.727665941743956},
     },
 }
 
@@ -323,18 +397,49 @@ BEST_MODEL_CONFIG = {
 #         "LGBM": {"loss_name": "threshold_weighted", "params": {"amplitude": 2.6315085506167315, "sigma": 0.00296053555003479}},  # smooth_ficr → threshold_weighted로 교체
 #     },
 # }
+# BEST_LOSS_CONFIG = {
+#     "kpx_group_1": {
+#         "XGB":  {"loss_name": "huber_capacity", "params": {"delta": 0.0554840098004973}},
+#         "LGBM": {"loss_name": "threshold_weighted_huber", "params": {"delta": 0.29468127479916906, "amplitude": 4.797742370763172, "sigma": 0.0033431269538905647}},
+#     },
+#     "kpx_group_2": {
+#         "XGB":  {"loss_name": "threshold_weighted", "params": {"amplitude": 0.4592602792418462, "sigma": 0.0077901431262762414}},
+#         "LGBM": {"loss_name": "threshold_weighted", "params": {"amplitude": 0.4592602792418462, "sigma": 0.0077901431262762414}},
+#     },
+#     "kpx_group_3": {
+#         "XGB":  {"loss_name": "threshold_weighted_huber", "params": {"delta": 0.2805674379379642, "amplitude": 3.72422814524701, "sigma": 0.00429474219228544}},
+#         "LGBM": {"loss_name": "threshold_weighted_huber", "params": {"delta": 0.15275316627633723, "amplitude": 1.3473432786208845, "sigma": 0.002375638833476553}},
+#     },
+# }
+
+# BEST_LOSS_CONFIG = {
+#     "kpx_group_1": {
+#         "XGB":  {"loss_name": "huber_threshold", "params": {"delta": 0.06312747042309949, "amplitude": 3.1959950475848333, "sigma": 0.0015986255106052408}},
+#         "LGBM": {"loss_name": "huber_threshold", "params": {"delta": 0.21492316324835245, "amplitude": 2.7546877614333125, "sigma": 0.004220720624548675}},
+#     },
+#     "kpx_group_2": {
+#         "XGB":  {"loss_name": "huber_threshold", "params": {"delta": 0.09070690911895868, "amplitude": 0.3183172090788175, "sigma": 0.006254136716066883}},
+#         "LGBM": {"loss_name": "huber_threshold", "params": {"delta": 0.11569593130196097, "amplitude": 0.1931331178011487, "sigma": 0.005456986232932154}},
+#     },
+#     "kpx_group_3": {
+#         "XGB":  {"loss_name": "huber_threshold", "params": {"delta": 0.08558956910286954, "amplitude": 0.3864086696159432, "sigma": 0.011120357873223699}},
+#         "LGBM": {"loss_name": "huber_threshold", "params": {"delta": 0.21140199214218833, "amplitude": 0.8931856467073521, "sigma": 0.015372469604656767}},
+#     },
+# }
+
+# test
 BEST_LOSS_CONFIG = {
     "kpx_group_1": {
-        "XGB":  {"loss_name": "huber_capacity", "params": {"delta": 0.0554840098004973}},
-        "LGBM": {"loss_name": "huber_capacity", "params": {"delta": 0.0554840098004973}},
+        "XGB":  {"loss_name": "huber_capacity", "params": {"delta": 0.05101472208866336}},
+        "LGBM": {"loss_name": "huber_threshold", "params": {"delta": 0.15583931767075299, "amplitude": 0.7805498896204464, "sigma": 0.013707341249762393}},
     },
     "kpx_group_2": {
-        "XGB":  {"loss_name": "huber_capacity", "params": {"delta": 0.05859095211742173}},
-        "LGBM": {"loss_name": "huber_capacity", "params": {"delta": 0.21282635719883228}},
+        "XGB":  {"loss_name": "threshold_weighted", "params": {"amplitude": 2.9697158814524376, "sigma": 0.003542796928018529}},
+        "LGBM": {"loss_name": "threshold_weighted", "params": {"amplitude": 0.13853458335022473, "sigma": 0.04093813608598782}},
     },
     "kpx_group_3": {
-        "XGB":  {"loss_name": "huber_capacity", "params": {"delta": 0.0641973832905204}},
-        "LGBM": {"loss_name": "huber_capacity", "params": {"delta": 0.28208356151657205}},
+        "XGB":  {"loss_name": "huber_capacity", "params": {"delta": 0.06925598810528834}},
+        "LGBM": {"loss_name": "threshold_weighted", "params": {"amplitude": 3.775953662454377, "sigma": 0.013400087150160007}},
     },
 }
 
