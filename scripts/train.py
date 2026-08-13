@@ -1148,6 +1148,16 @@ def _split_group_data(train_df, X_train_imp, target, capacity):
         ws_tr = X_tr[ws_col].to_numpy()
         ramp_mask = (ws_tr >= ramp_range[0]) & (ws_tr < ramp_range[1])
         sw_tr = np.where(ramp_mask, sw_tr * RAMP_SAMPLE_WEIGHT, sw_tr)
+    HIGH_OUTPUT_THRESHOLD = 0.70
+    HIGH_OUTPUT_WEIGHT = 2.5
+    
+    high_output_mask = y_tr >= (capacity * HIGH_OUTPUT_THRESHOLD)
+    sw_tr = np.where(high_output_mask, sw_tr * HIGH_OUTPUT_WEIGHT, sw_tr)
+    
+    # 전체 Train셋(sw_use)에도 동일하게 적용
+    if 'sw_use' in locals():
+        high_output_mask_use = y_train_use >= (capacity * HIGH_OUTPUT_THRESHOLD)
+        sw_use = np.where(high_output_mask_use, sw_use * HIGH_OUTPUT_WEIGHT, sw_use)
 
     # 4. 무효구간 처리 (Train 전체 셋)
     use_valid = y_train_use >= capacity * VALID_RATIO_THRESHOLD

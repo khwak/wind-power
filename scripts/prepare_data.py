@@ -968,11 +968,16 @@ def _apply_scada_proxy_features(
 
         out[f"ws117_calibrated_group{group}"] = calibrated_ws
 
-        out[meta["power_feature"]] = apply_power_curve_lookup(
-            calibrated_ws,
-            power_lookups[group],
-            n_turbines=meta["n_turbines"],
-        )
+        curve = apply_group_hourly_power_quantile_lookup(calibrated_ws, power_lookups[group])
+        base_name = meta["power_feature"]
+        
+        # 기존 모델/GAM과의 호환성을 위해 q50을 기본 이름으로 매핑
+        out[base_name] = curve["q50"]
+        out[f"{base_name}_q65"] = curve["q65"]
+        out[f"{base_name}_q80"] = curve["q80"]
+        out[f"{base_name}_trimmed_mean"] = curve["trimmed_mean"]
+        out[f"{base_name}_mean"] = curve["mean"]
+
         out[meta["variability_feature"]] = apply_variability_lookup(
             calibrated_ws,
             out[wd_col],
@@ -1198,9 +1203,16 @@ def get_tabular_data(
             else scada_unison_fit
         )
         turbines = _turbine_names(meta["maker"], meta["turbines"])
-        power_lookups[group] = fit_power_curve_lookup(
-            scada_source,
-            turbines,
+        power_lookups[group] = fit_group_hourly_power_quantile_lookup(
+            group=group,
+            meta=meta,
+            ldaps_train_grid=ldaps_train_grid,
+            grid_id=group_grids[group],
+            scada_fit=scada_source,
+            cutoff=cutoff,
+            ws_bin_width=0.5,
+            min_count=30,
+            trim_ratio=0.10
         )
         variability_lookups[group] = fit_variability_lookup(
             scada_source,
@@ -1372,3 +1384,77 @@ def get_bounded_validation_xy(train_df, X_train, target, validation_start, windo
         train_df.loc[mask, target].reset_index(drop=True),
         train_df.loc[mask, "forecast_kst_dtm"].reset_index(drop=True),
     )
+
+
+# Trimmed Mean 및 Quantile Power Curve 함수
+def _trimmed_mean(values, trim_ratio: float = 0.10) -> float:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if len(arr) == 0: return np.nan
+    arr = np.sort(arr)
+    k = int(np.floor(len(arr) * trim_ratio))
+    if k == 0 or len(arr) - 2 * k <= 0: return float(np.mean(arr))
+    return float(np.mean(arr[k:-k]))
+
+
+def fit_group_hourly_power_quantile_lookup(
+    group: int, meta: dict, ldaps_train_grid: pd.DataFrame, grid_id: int,
+    scada_fit: pd.DataFrame, cutoff: pd.Timestamp, ws_bin_width: float = 0.5,
+    min_count: int = 30, trim_ratio: float = 0.10
+) -> pd.DataFrame:
+    turbines = _turbine_names(meta["maker"], meta["turbines"])
+    power_cols = [f"{turbine}_power_kw10m" for turbine in turbines]
+    
+    scada = scada_fit[scada_fit["kst_dtm"] < cutoff][["kst_dtm"] + power_cols].copy()
+    
+    # 10분 단위 그룹 전체 발전량 합산
+    scada["group_power_10m"] = scada[power_cols].sum(axis=1, min_count=len(power_cols))
+    scada["forecast_kst_dtm"] = scada["kst_dtm"].dt.floor("h")
+    
+    # 1시간 단위 집계 (6개의 10분 데이터가 모두 있는 경우만)
+    scada_hourly = scada.groupby("forecast_kst_dtm", as_index=False).agg(
+        group_power_kwh=("group_power_10m", "sum"),
+        n_10min=("group_power_10m", "count")
+    )
+    scada_hourly = scada_hourly[scada_hourly["n_10min"] == 6].copy()
+    scada_hourly["group_power_kwh"] = scada_hourly["group_power_kwh"].clip(lower=0)
+    
+    ldaps_group = ldaps_train_grid[
+        (ldaps_train_grid["grid_id"] == grid_id) & (ldaps_train_grid["forecast_kst_dtm"] < cutoff)
+    ][["forecast_kst_dtm", "ws117_power_ldaps"]]
+    
+    merged = ldaps_group.merge(scada_hourly[["forecast_kst_dtm", "group_power_kwh"]], on="forecast_kst_dtm", how="inner").dropna()
+    merged["ws_bin"] = np.floor(merged["ws117_power_ldaps"] / ws_bin_width)
+    
+    lookup = merged.groupby("ws_bin")["group_power_kwh"].agg(
+        q50=lambda x: x.quantile(0.50),
+        q65=lambda x: x.quantile(0.65),
+        q80=lambda x: x.quantile(0.80),
+        trimmed_mean=lambda x: _trimmed_mean(x, trim_ratio=trim_ratio),
+        mean="mean", count="count"
+    ).reset_index().sort_values("ws_bin")
+    
+    stat_cols = ["q50", "q65", "q80", "trimmed_mean", "mean"]
+    lookup.loc[lookup["count"] < min_count, stat_cols] = np.nan
+    lookup[stat_cols] = lookup[stat_cols].interpolate(limit_direction="both")
+    lookup["ws_center"] = (lookup["ws_bin"] + 0.5) * ws_bin_width
+    lookup = lookup.dropna(subset=["ws_center", "q50", "q65", "q80", "trimmed_mean"])
+    
+    # Quantile 역전 방지
+    q_values = np.sort(lookup[["q50", "q65", "q80"]].to_numpy(), axis=1)
+    lookup[["q50", "q65", "q80"]] = q_values
+    
+    return lookup[["ws_center", "q50", "q65", "q80", "trimmed_mean", "mean", "count"]]
+
+
+def apply_group_hourly_power_quantile_lookup(wind_speed, lookup: pd.DataFrame) -> dict:
+    ws = np.asarray(wind_speed, dtype=float)
+    result = {}
+    valid = np.isfinite(ws)
+    x = lookup["ws_center"].to_numpy(dtype=float)
+    
+    for col in ["q50", "q65", "q80", "trimmed_mean", "mean"]:
+        values = np.full(len(ws), np.nan, dtype=float)
+        values[valid] = np.interp(ws[valid], x, lookup[col].to_numpy(dtype=float))
+        result[col] = values
+    return result
