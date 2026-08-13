@@ -941,8 +941,8 @@ def _apply_scada_proxy_features(
     group_grids: dict[int, int],
     power_lookups: dict[int, pd.DataFrame],
     variability_lookups: dict[int, pd.DataFrame],
-    shear_season_lookups: dict[int, tuple[dict[str, pd.DataFrame], pd.DataFrame]],  # [신규] group -> (season_lookups, global_lookup)
-    seasonal_clusters: dict[str, dict[str, list[int]]],  # [신규] "kpx_group_N" -> {season_name: months}
+    shear_season_lookups: dict[int, tuple[dict[str, pd.DataFrame], pd.DataFrame]], 
+    seasonal_clusters: dict[str, dict[str, list[int]]], 
 ) -> pd.DataFrame:
     out = frame.copy()
 
@@ -952,9 +952,7 @@ def _apply_scada_proxy_features(
         wd_col = f"wd117_ldaps_grid_{grid_id}"
 
         if ws_col not in out.columns or wd_col not in out.columns:
-            raise KeyError(
-                f"그룹 {group} 대표 grid={grid_id} 피처가 없습니다: {ws_col}, {wd_col}"
-            )
+            raise KeyError(f"그룹 {group} 대표 grid={grid_id} 피처가 없습니다: {ws_col}, {wd_col}")
 
         season_lookups, global_lookup = shear_season_lookups[group]
         group_clusters = seasonal_clusters.get(f"kpx_group_{group}", {})
@@ -967,6 +965,15 @@ def _apply_scada_proxy_features(
             calibrated_ws = apply_shear_calibration_lookup(out[ws_col], global_lookup)
 
         out[f"ws117_calibrated_group{group}"] = calibrated_ws
+
+        # ==========================================
+        # [신규 추가] 후류 효과(Wake Effect) 및 풍향-풍속 교호작용 피처
+        # ==========================================
+        wd_rad = np.radians(out[wd_col])
+        out[f"wake_proxy_u_group{group}"] = calibrated_ws * np.cos(wd_rad)
+        out[f"wake_proxy_v_group{group}"] = calibrated_ws * np.sin(wd_rad)
+        out[f"wake_energy_u_group{group}"] = (calibrated_ws ** 3) * np.cos(wd_rad)
+        out[f"wake_energy_v_group{group}"] = (calibrated_ws ** 3) * np.sin(wd_rad)
 
         curve = apply_group_hourly_power_quantile_lookup(calibrated_ws, power_lookups[group])
         base_name = meta["power_feature"]

@@ -4,6 +4,7 @@ import pandas as pd
 import json
 import datetime
 import optuna
+from pathlib import Path
 import lightgbm as lgb
 import torch
 import torch.nn as nn
@@ -21,7 +22,7 @@ import matplotlib.pyplot as plt
 
 
 from config import (
-    TARGET_COLS, CAPACITY_KWH, RF_PARAMS, ET_PARAMS, XGB_PARAMS, LGBM_PARAMS, OUTPUT_DIR, MODEL_DIR,
+    TARGET_COLS, CAPACITY_KWH, RF_PARAMS, ET_PARAMS, XGB_PARAMS, LGBM_PARAMS, OUTPUT_DIR, MODEL_DIR, CHRONOS_MODEL_PATH,
     VALID_RATIO_THRESHOLD, EXCLUDE_INVALID_ROWS, INVALID_SAMPLE_WEIGHT,
     VAL_HOLDOUT_RATIO, EARLY_STOPPING_ROUNDS,
     OPTUNA_N_TRIALS, OPTUNA_SEED, OPTUNA_SEARCH_SPACE, HUBER_HESS_FLOOR,
@@ -213,6 +214,14 @@ def run_seasonal_wind_regime_cv(target, capacity, fold_starts, window_days=CV_WI
     for start in fold_starts:
         train_df, X_train, _, _, _ = get_tabular_data(mode="validation", validation_start=start)
         X_train_imp, _ = _prepare_common(train_df, X_train, X_train, train_df)
+
+        # [신규 삽입] Optuna 탐색 시에도 잔차 예측이 동작하도록 베이스라인 주입
+        base_feat = {
+            "kpx_group_1": "vestas_power_curve_pred_group1",
+            "kpx_group_2": "vestas_power_curve_pred_group2",
+            "kpx_group_3": "unison_power_curve_pred"
+        }[target]
+        X_train_imp["_BASELINE_"] = X_train_imp[base_feat]
 
         X_tr, y_tr = get_target_xy(train_df, X_train_imp, target, subset="fit")
         X_v, y_v, ts_v = get_bounded_validation_xy(train_df, X_train_imp, target, start, window_days)
@@ -470,58 +479,75 @@ def _lgb_objective_wrapper(base_obj_fn, sample_weight):
 
 class _OffsetModel:
     """예측을 항상 절대값(kWh) 스케일로 돌려주는 얇은 래퍼.
-    내부 모델은 (y - offset)로 학습됐으므로, predict() 호출 시 offset을 자동으로 다시 더한다.
-    train.py 어디서 .predict()를 호출하든 별도 처리 없이 항상 올바른 스케일이 나오도록 보장한다."""
-    def __init__(self, model, offset):
+    _BASELINE_ 컬럼이 X에 존재하면 SOTA 잔차 기반 예측(Residual Prediction)으로 동작하고,
+    없으면 기존처럼 스칼라 평균 오프셋으로 동작합니다."""
+    def __init__(self, model, scalar_offset=0.0):
         self.model = model
-        self.offset = offset
+        self.scalar_offset = scalar_offset
 
     def predict(self, X):
-        return self.model.predict(X) + self.offset
+        if "_BASELINE_" in X.columns:
+            return self.model.predict(X) + X["_BASELINE_"].to_numpy()
+        return self.model.predict(X) + self.scalar_offset
 
     def __getattr__(self, name):
-        return getattr(self.model, name)  # feature_importances_ 등은 원본 모델에 위임
+        return getattr(self.model, name)
 
 def _fit_xgb_with_params(loss_name, params, X_tr, y_tr, sw_tr, X_val, y_val, capacity, model_params=None):
-    y_offset = float(y_tr.mean())
-    y_tr_c = y_tr - y_offset
-    y_val_c = y_val - y_offset
+    if "_BASELINE_" in X_tr.columns:
+        y_offset_tr = X_tr["_BASELINE_"].to_numpy()
+        y_offset_val = X_val["_BASELINE_"].to_numpy()
+        scalar_offset = 0.0
+    else:
+        y_offset_tr = float(y_tr.mean())
+        y_offset_val = y_offset_tr
+        scalar_offset = y_offset_tr
+
+    y_tr_c = y_tr - y_offset_tr
+    y_val_c = y_val - y_offset_val
 
     base_obj_fn = LOSS_BUILDERS[loss_name](capacity, **params)
-    # 클로저를 이용해 sw_tr 캡처
     def obj_fn(y_true, y_pred, sample_weight=None):
         return base_obj_fn(y_true, y_pred, sample_weight=sample_weight)
+        
     xgb_kwargs = dict(model_params) if model_params is not None else {k: v for k, v in XGB_PARAMS.items()}
     model = XGBRegressor(
         **xgb_kwargs,
         objective=obj_fn,
-        eval_metric=lambda y_true, y_pred: _neg_ficr(y_true + y_offset, y_pred + y_offset, capacity),
+        eval_metric=lambda yt, yp: _neg_ficr(yt + y_offset_val, yp + y_offset_val, capacity),
         early_stopping_rounds=EARLY_STOPPING_ROUNDS,
     )
     model.fit(X_tr, y_tr_c, sample_weight=sw_tr, eval_set=[(X_val, y_val_c)], verbose=False)
 
-    wrapped = _OffsetModel(model, y_offset)
+    wrapped = _OffsetModel(model, scalar_offset)
     val_ficr = _true_ficr(y_val.values, wrapped.predict(X_val), capacity)
     return wrapped, val_ficr
 
 
 def _fit_lgbm_with_params(loss_name, params, lgbm_params, X_tr, y_tr, sw_tr, X_val, y_val, capacity):
-    y_offset = float(y_tr.mean())
-    y_tr_c = y_tr - y_offset
-    y_val_c = y_val - y_offset
+    if "_BASELINE_" in X_tr.columns:
+        y_offset_tr = X_tr["_BASELINE_"].to_numpy()
+        y_offset_val = X_val["_BASELINE_"].to_numpy()
+        scalar_offset = 0.0
+    else:
+        y_offset_tr = float(y_tr.mean())
+        y_offset_val = y_offset_tr
+        scalar_offset = y_offset_tr
+
+    y_tr_c = y_tr - y_offset_tr
+    y_val_c = y_val - y_offset_val
 
     base_obj_fn = LOSS_BUILDERS[loss_name](capacity, **params)
-    # 수정된 래퍼에 sw_tr 전달
     obj_fn = _lgb_objective_wrapper(base_obj_fn, sw_tr)
     model = LGBMRegressor(**lgbm_params, objective=obj_fn)
     model.fit(
         X_tr, y_tr_c, sample_weight=sw_tr,
         eval_set=[(X_val, y_val_c)],
-        eval_metric=lambda y_true, y_pred: _lgb_ficr(y_true + y_offset, y_pred + y_offset, capacity),
+        eval_metric=lambda yt, yp: _lgb_ficr(yt + y_offset_val, yp + y_offset_val, capacity),
         callbacks=[lgb.early_stopping(stopping_rounds=EARLY_STOPPING_ROUNDS, verbose=False)],
     )
 
-    wrapped = _OffsetModel(model, y_offset)
+    wrapped = _OffsetModel(model, scalar_offset)
     val_ficr = _true_ficr(y_val.values, wrapped.predict(X_val), capacity)
     return wrapped, val_ficr
 
@@ -1081,6 +1107,9 @@ def run_seasonal_optuna_search(model_type, target, capacity, lgbm_params, fold_d
 
 def _record_importance(raw_df, norm_df, target, name, imp_vals):
     col_name = f"{target}_{name}"
+    if len(imp_vals) > len(raw_df.index):
+        imp_vals = imp_vals[:len(raw_df.index)]
+        
     raw_df[col_name] = imp_vals
     val_min, val_max = imp_vals.min(), imp_vals.max()
     norm_df[col_name] = (imp_vals - val_min) / (val_max - val_min) if val_max > val_min else np.zeros_like(imp_vals)
@@ -1299,29 +1328,23 @@ def train_ensemble_final(train_df, X_train, X_test, sample_sub):
     final_used_log = []
 
     for target in TARGET_COLS:
+        # 잔차 예측 동작을 위한 베이스라인 주입
+        base_feat = {
+            "kpx_group_1": "vestas_power_curve_pred_group1",
+            "kpx_group_2": "vestas_power_curve_pred_group2",
+            "kpx_group_3": "unison_power_curve_pred"
+        }[target]
+        X_train_imp["_BASELINE_"] = X_train_imp[base_feat]
+        X_test_imp["_BASELINE_"] = X_test_imp[base_feat]
+        
         capacity = CAPACITY_KWH[target]
         X_train_use, y_train_use, sw_use, X_tr, y_tr, sw_tr, X_val, y_val = _split_group_data(
             train_df, X_train_imp, target, capacity
         )
 
-        # rf = RandomForestRegressor(**RF_PARAMS)
-        # rf.fit(X_train_use, y_train_use, sample_weight=sw_use)
-        # preds.append(rf.predict(X_test_imp))
-        # val_preds.append(rf.predict(X_val))  # [신규]
-        # print(f"  [{target}] RF Trained.")
-        # _record_importance(raw_feature_importances, norm_feature_importances, target, "RF", rf.feature_importances_)
-
-        # et = ExtraTreesRegressor(**ET_PARAMS)
-        # et.fit(X_train_use, y_train_use, sample_weight=sw_use)
-        # preds.append(et.predict(X_test_imp))
-        # val_preds.append(et.predict(X_val))  # [신규]
-        # print(f"  [{target}] ET Trained.")
-        # _record_importance(raw_feature_importances, norm_feature_importances, target, "ET", et.feature_importances_)
-
         target_regime = regime_all_cfg.get(target)   
         use_curve = False
         if target_regime is not None:
-            # 월별 중첩 구조이므로 모든 월의 regimes를 순회하며 확인
             for m_str, m_data in target_regime.items():
                 if any(r["weights"].get("curve", 0) > 0 for r in m_data["regimes"]):
                     use_curve = True
@@ -1337,7 +1360,7 @@ def train_ensemble_final(train_df, X_train, X_test, sample_sub):
             print(f"  [{target}] Ridge(curve) Trained. val_ficr={curve_val_ficr:.4f}")
             
         cfg = BEST_LOSS_CONFIG[target]
-        model_cfg = BEST_MODEL_CONFIG.get(target, {})  # [신규]
+        model_cfg = BEST_MODEL_CONFIG.get(target, {})
 
         xgb_cfg = cfg["XGB"]
         xgb_model_params = model_cfg.get("XGB") or {"random_state": 42, "n_jobs": -1}
@@ -1345,7 +1368,6 @@ def train_ensemble_final(train_df, X_train, X_test, sample_sub):
         lgb_model_params = {**lgbm_params, **model_cfg.get("LGBM", {})}
 
         if target == "kpx_group_3":
-            # 사전 학습을 위한 Group 1, 2 데이터 병합
             X_src_list, y_src_list, sw_src_list = [], [], []
             for src_target in ["kpx_group_1", "kpx_group_2"]:
                 X_src, y_src = get_target_xy(train_df, X_train_imp, src_target, subset="fit")
@@ -1358,19 +1380,19 @@ def train_ensemble_final(train_df, X_train, X_test, sample_sub):
             sw_source = np.concatenate(sw_src_list)
             capacity_source = CAPACITY_KWH["kpx_group_1"]
 
-            # [수정됨] Zero-shot 대신 Transfer Learning(사전학습 + 미세조정) 적용
+            # Transfer Learning 적용 (Group 3 튜닝 파라미터 유지)
             best_xgb, xgb_val_ficr = _fit_xgb_transfer(
                 target, capacity, capacity_source, X_source, y_source, sw_source,
                 X_tr, y_tr, sw_tr, X_val, y_val, 
                 xgb_cfg["loss_name"], xgb_cfg["params"], xgb_model_params,
-                finetune_round_ratio=0.4, finetune_early_stopping_rounds=150
+                finetune_round_ratio=0.2, finetune_early_stopping_rounds=60
             )
             
             best_lgb, lgb_val_ficr = _fit_lgbm_transfer(
                 target, capacity, capacity_source, X_source, y_source, sw_source,
                 X_tr, y_tr, sw_tr, X_val, y_val, 
                 lgb_cfg["loss_name"], lgb_cfg["params"], lgb_model_params,
-                finetune_round_ratio=0.4, finetune_early_stopping_rounds=150
+                finetune_round_ratio=0.2, finetune_early_stopping_rounds=60
             )
         else:
             best_xgb, xgb_val_ficr = _fit_xgb_with_params(
@@ -1402,30 +1424,24 @@ def train_ensemble_final(train_df, X_train, X_test, sample_sub):
         )
         final_used_log.append({"target": target, "model": "LGBM", "loss_name": lgb_cfg["loss_name"],
                                 "params": str(lgb_cfg["params"]), "val_ficr": lgb_val_ficr})
+        
         imp_vals = best_lgb.feature_importances_
         if imp_vals.sum() > 0:
             imp_vals = imp_vals / imp_vals.sum()
         _record_importance(raw_feature_importances, norm_feature_importances, target, "LGBM", imp_vals)
 
-        # ensemble_preds[target] = np.clip(np.mean(preds, axis=0), 0, capacity)
-        # [신규] 검증셋 FICR 최대화 가중치로 앙상블
-        # weights = _optimize_ensemble_weights(val_preds, y_val.values, capacity)
-        # print(f"  [{target}] Ensemble weights (RF/ET/XGB/LGBM): {np.round(weights, 3)}")
-        # weighted_pred = np.average(preds, axis=0, weights=weights)
-        # ensemble_preds[target] = np.clip(weighted_pred, 0, capacity)
-        # 수정 — regime_config.json 그대로 적용 + 모니터링용 로그만 남김(동작에 영향 없음)
         ws_col = WS_FEATURE_COL[target]
 
+        # 순수 GBDT 앙상블 규칙 적용 (Chronos 완전 제외)
         if target_regime is not None:
             regime_val_pred = apply_regime_config(
                 model_val_preds, X_val[ws_col], 
-                train_df.loc[X_val.index, "forecast_kst_dtm"], # 시간 정보 추가
+                train_df.loc[X_val.index, "forecast_kst_dtm"], 
                 target_regime, capacity, target
             )
             regime_val_ficr = _true_ficr(y_val.values, regime_val_pred, capacity)
             simple_avg_val_ficr = _true_ficr(y_val.values, np.mean(list(model_val_preds.values()), axis=0), capacity)
-            print(f"  [{target}] [모니터링, hyperparam-val] regime_config={regime_val_ficr:.4f} "
-                f"vs 단순평균={simple_avg_val_ficr:.4f}")
+            print(f"  [{target}] [모니터링, hyperparam-val] regime_config={regime_val_ficr:.4f} vs 단순평균={simple_avg_val_ficr:.4f}")
 
             if regime_val_ficr >= simple_avg_val_ficr:
                 raw_pred = apply_regime_config(
@@ -1435,13 +1451,14 @@ def train_ensemble_final(train_df, X_train, X_test, sample_sub):
                 )
                 print(f"  [{target}] -> regime_config 채택")
             else:
-                raw_pred = np.clip(np.mean(list(model_test_preds.values()), axis=0), 0, capacity)
+                raw_pred = np.mean(list(model_test_preds.values()), axis=0)
                 print(f"  [{target}] [주의] regime_config가 단순평균보다 낮음 -> 단순평균으로 자동 폴백.")
-
-            ensemble_preds[target] = np.clip(raw_pred, 0, capacity)
         else:
-            print(f"  [{target}] regime_config 없음 -> 단순평균 폴백. scripts/discover_regimes.py를 먼저 실행하세요.")
-            ensemble_preds[target] = np.clip(np.mean(list(model_test_preds.values()), axis=0), 0, capacity)
+            print(f"  [{target}] regime_config 없음 -> 단순평균 폴백.")
+            raw_pred = np.mean(list(model_test_preds.values()), axis=0)
+
+        # 최종 클리핑 및 저장
+        ensemble_preds[target] = np.clip(raw_pred, 0, capacity)
 
     raw_feature_importances['mean_importance_norm'] = norm_feature_importances.mean(axis=1)
     sorted_fi = raw_feature_importances.sort_values(by='mean_importance_norm', ascending=False)
@@ -1684,39 +1701,44 @@ def _fit_xgb_transfer(target, capacity, capacity_source,
                        finetune_early_stopping_rounds=150):
     y_source_scaled = y_source / capacity_source * capacity
 
-    y_offset = float(y_tr.mean())
-    y_source_c = y_source_scaled - y_offset
-    y_tr_c = y_tr - y_offset
-    y_val_c = y_val - y_offset
+    if "_BASELINE_" in X_tr.columns:
+        y_offset_src = X_source["_BASELINE_"].to_numpy() / capacity_source * capacity
+        y_offset_tr = X_tr["_BASELINE_"].to_numpy()
+        y_offset_val = X_val["_BASELINE_"].to_numpy()
+        scalar_offset = 0.0
+    else:
+        y_offset_tr = float(y_tr.mean())
+        y_offset_src = y_offset_tr
+        y_offset_val = y_offset_tr
+        scalar_offset = y_offset_tr
+
+    y_source_c = y_source_scaled - y_offset_src
+    y_tr_c = y_tr - y_offset_tr
+    y_val_c = y_val - y_offset_val
 
     base_obj_fn = LOSS_BUILDERS[loss_name](capacity, **loss_params)
-    # XGBoost가 sample_weight를 자동으로 넣어줄 수 있도록, 반드시 이 시그니처 그대로 정의
     def obj_fn(y_true, y_pred, sample_weight=None):
         return base_obj_fn(y_true, y_pred, sample_weight=sample_weight)
 
-    # 1) 사전학습 (source) — .fit(sample_weight=sw_source)를 주면 XGBoost가 obj_fn에 자동 전달
     pre_kwargs = dict(model_params)
     pre_model = XGBRegressor(**pre_kwargs, objective=obj_fn)
     pre_model.fit(X_source, y_source_c, sample_weight=sw_source, verbose=False)
 
-    # 2) fine-tune (target) — xgb_model=로 이어서 학습
     finetune_kwargs = dict(model_params)
     finetune_kwargs["n_estimators"] = max(
         int(model_params.get("n_estimators", 300) * finetune_round_ratio),
-        finetune_early_stopping_rounds + 20,   # patience보다 넉넉하게 cap을 잡음
+        finetune_early_stopping_rounds + 20,
     )
     finetuned = XGBRegressor(
         **finetune_kwargs,
-        objective=obj_fn,   # 같은 obj_fn 재사용 — .fit(sample_weight=sw_tr)가 자동으로 들어감
-        eval_metric=lambda yt, yp: _neg_ficr(yt + y_offset, yp + y_offset, capacity),
+        objective=obj_fn,
+        eval_metric=lambda yt, yp: _neg_ficr(yt + y_offset_val, yp + y_offset_val, capacity),
         early_stopping_rounds=finetune_early_stopping_rounds,
     )
     finetuned.fit(X_tr, y_tr_c, sample_weight=sw_tr, eval_set=[(X_val, y_val_c)],
                   xgb_model=pre_model.get_booster(), verbose=False)
-    print(f"    [디버그] {target} XGB fine-tune early_stopping_rounds={finetune_early_stopping_rounds}, "
-          f"best_iteration={finetuned.best_iteration} / cap={finetune_kwargs['n_estimators']}")
 
-    wrapped = _OffsetModel(finetuned, y_offset)
+    wrapped = _OffsetModel(finetuned, scalar_offset)
     val_ficr = _true_ficr(y_val.values, wrapped.predict(X_val), capacity)
     return wrapped, val_ficr
 
@@ -1728,10 +1750,21 @@ def _fit_lgbm_transfer(target, capacity, capacity_source,
                         finetune_round_ratio=0.4,
                         finetune_early_stopping_rounds=150):
     y_source_scaled = y_source / capacity_source * capacity
-    y_offset = float(y_tr.mean())
-    y_source_c = y_source_scaled - y_offset
-    y_tr_c = y_tr - y_offset
-    y_val_c = y_val - y_offset
+    
+    if "_BASELINE_" in X_tr.columns:
+        y_offset_src = X_source["_BASELINE_"].to_numpy() / capacity_source * capacity
+        y_offset_tr = X_tr["_BASELINE_"].to_numpy()
+        y_offset_val = X_val["_BASELINE_"].to_numpy()
+        scalar_offset = 0.0
+    else:
+        y_offset_tr = float(y_tr.mean())
+        y_offset_src = y_offset_tr
+        y_offset_val = y_offset_tr
+        scalar_offset = y_offset_tr
+
+    y_source_c = y_source_scaled - y_offset_src
+    y_tr_c = y_tr - y_offset_tr
+    y_val_c = y_val - y_offset_val
 
     base_obj = LOSS_BUILDERS[loss_name](capacity, **loss_params)
 
@@ -1747,14 +1780,12 @@ def _fit_lgbm_transfer(target, capacity, capacity_source,
     finetuned.fit(
         X_tr, y_tr_c, sample_weight=sw_tr,
         eval_set=[(X_val, y_val_c)],
-        eval_metric=lambda yt, yp: _lgb_ficr(yt + y_offset, yp + y_offset, capacity),
+        eval_metric=lambda yt, yp: _lgb_ficr(yt + y_offset_val, yp + y_offset_val, capacity),
         callbacks=[lgb.early_stopping(stopping_rounds=finetune_early_stopping_rounds, verbose=False)],
         init_model=pre_model.booster_,
     )
-    print(f"    [디버그] {target} LGBM fine-tune early_stopping_rounds={finetune_early_stopping_rounds}, "
-          f"best_iteration={finetuned.best_iteration_} / cap={finetune_params['n_estimators']}")
 
-    wrapped = _OffsetModel(finetuned, y_offset)
+    wrapped = _OffsetModel(finetuned, scalar_offset)
     val_ficr = _true_ficr(y_val.values, wrapped.predict(X_val), capacity)
     return wrapped, val_ficr
 

@@ -10,19 +10,31 @@ conda activate wind
 # 'autogluon', 'ensemble', 'ag_ensemble'
 # 'final', 'search', 'quantile'
 MODE="final"
+RUN_OPTIMIZATION=false
 
-echo "=== [1/4] prepare_data.py 시작: $(date) ==="
+echo "=== [1/5] prepare_data.py 시작: $(date) ==="
 python prepare_data.py
 # python prepare_data_all.py
 
-echo "=== [2/4] train.py 시작 (Mode: $MODE): $(date) ==="
-python train.py --mode $MODE
-# python train_XGB+LGBM.py --mode $MODE
+if [ "$RUN_OPTIMIZATION" = true ]; then
+    echo "=== [2/5] 하이퍼파라미터 및 앙상블 최적화 시작: $(date) ==="
+    
+    echo "--> 1. 손실함수 파라미터 재탐색 (discover_loss_config.py)"
+    python discover_loss_config.py
+    
+    echo "--> 2. 계절/구간별 앙상블 규칙 탐색 (discover_regimes.py)"
+    python discover_regimes.py
+else
+    echo "=== [2/5] 최적화 건너뜀 (기존 config.py 설정 사용) ==="
+fi
 
-echo "=== [3/4] evaluate.py 시작: $(date) ==="
+echo "=== [3/5] train.py 시작 (Mode: $MODE): $(date) ==="
+python train.py --mode $MODE
+
+echo "=== [4/5] evaluate.py 시작: $(date) ==="
 python evaluate.py
 
-echo "=== [4/4] visualize.py 시작: $(date) ==="
+echo "=== [5/5] visualize.py 시작: $(date) ==="
 python visualize.py --mode $MODE
 
 duration=$SECONDS

@@ -82,4 +82,4 @@ def create_and_verify_submission(input_pred_path: str = None):
 
 if __name__ == "__main__":
     # 특정 파일 지정시: create_and_verify_submission("/path/to/your/pred.csv")
-    create_and_verify_submission("/home/khwak/wind-power/outputs/submission_final_20260813_111104.csv")
+    create_and_verify_submission("/home/khwak/wind-power/outputs/submission_final_20260813_134103.csv")

@@ -303,7 +303,12 @@ HUBER_HESS_FLOOR = 1e-2
 # SEASONAL_OPTUNA_TRIAL_BUDGET = {"huber_capacity": 10, "threshold_weighted": 15, "smooth_ficr": 15}
 # SEASONAL_OPTUNA_TRIAL_BUDGET = {"huber_capacity": 10, "threshold_weighted": 15}
 # SEASONAL_OPTUNA_TRIAL_BUDGET = {"huber_capacity": 10, "threshold_weighted": 10, "threshold_weighted_huber": 20}
-SEASONAL_OPTUNA_TRIAL_BUDGET = {"huber_capacity": 15, "threshold_weighted": 25, "huber_threshold": 25}
+SEASONAL_OPTUNA_TRIAL_BUDGET = {
+    "huber_capacity": 15, 
+    "threshold_weighted": 20, 
+    "huber_threshold": 20,
+    "asymmetric_zero_avoidance": 25  # [추가] 0원 추락 방지용 비대칭 손실함수 활성화
+}
 
 # 손실함수 탐색 공간
 OPTUNA_SEARCH_SPACE = {
@@ -315,7 +320,7 @@ OPTUNA_SEARCH_SPACE = {
         "sigma": {"low": 0.001, "high": 0.05, "log": True},
     },
     "smooth_ficr": {
-        "anchor_weight": {"low": 0.5, "high": 0.95, "log": False},  # 0.1~0.999 → 0.5~0.95
+        "anchor_weight": {"low": 0.5, "high": 0.95, "log": False},
         "k": {"low": 50, "high": 800, "log": True},
     },
     "threshold_weighted_huber": {
@@ -328,6 +333,12 @@ OPTUNA_SEARCH_SPACE = {
         "amplitude": {"low": 0.1, "high": 15.0, "log": True},
         "sigma": {"low": 0.001, "high": 0.05, "log": True},
     },
+    "asymmetric_zero_avoidance": {  # [신규 추가]
+        "delta": {"low": 0.05, "high": 0.30, "log": True},
+        "amplitude": {"low": 0.5, "high": 15.0, "log": True},
+        "sigma": {"low": 0.001, "high": 0.05, "log": True},
+        "asymmetric_penalty": {"low": 1.5, "high": 8.0, "log": False},
+    },
 }
 
 STABILITY_LAMBDA = 0.0
@@ -335,21 +346,23 @@ STABILITY_LAMBDA = 0.0
 # 모델 탐색 공간
 XGB_SEARCH_SPACE = {
     "n_estimators": {"low": 100, "high": 800, "log": False, "type": "int"},
-    "max_depth": {"low": 3, "high": 7, "log": False, "type": "int"},              # [개선] 10 -> 7 축소 (과적합 방지)
-    "learning_rate": {"low": 0.01, "high": 0.08, "log": True, "type": "float"},   # [개선] 0.2 -> 0.08 축소
+    "max_depth": {"low": 3, "high": 6, "log": False, "type": "int"},               # [수정] 7 -> 6 축소 (강력한 피처로 인해 얕은 트리 권장)
+    "learning_rate": {"low": 0.01, "high": 0.1, "log": True, "type": "float"},     # [수정] 상한 0.1로 약간 확장
     "subsample": {"low": 0.6, "high": 1.0, "log": False, "type": "float"},
     "colsample_bytree": {"low": 0.5, "high": 1.0, "log": False, "type": "float"},
-    "reg_lambda": {"low": 1.0, "high": 10.0, "log": True, "type": "float"},       # [신규] L2 정규화 페널티 추가
+    "reg_alpha": {"low": 0.01, "high": 50.0, "log": True, "type": "float"},        # [신규] 분위수 피처 간 다중공선성 제어를 위한 L1 정규화
+    "reg_lambda": {"low": 1.0, "high": 50.0, "log": True, "type": "float"},        # [수정] 10.0 -> 50.0 확대 (L2 정규화 강화)
 }
 LGBM_SEARCH_SPACE = {
     "n_estimators": {"low": 100, "high": 800, "log": False, "type": "int"},
-    "num_leaves": {"low": 15, "high": 127, "log": False, "type": "int"},           # [개선] 127 -> 63 축소 (과적합 방지)
-    "learning_rate": {"low": 0.01, "high": 0.08, "log": True, "type": "float"},   # [개선] 0.2 -> 0.08 축소
+    "num_leaves": {"low": 15, "high": 63, "log": False, "type": "int"},            # [수정] 127 -> 63 축소 (과적합 방지)
+    "learning_rate": {"low": 0.01, "high": 0.1, "log": True, "type": "float"},     # [수정] 상한 0.1로 약간 확장
     "subsample": {"low": 0.6, "high": 1.0, "log": False, "type": "float"},
     "colsample_bytree": {"low": 0.5, "high": 1.0, "log": False, "type": "float"},
-    "reg_lambda": {"low": 1.0, "high": 10.0, "log": True, "type": "float"},       # [신규] L2 정규화 페널티 추가
+    "min_child_samples": {"low": 20, "high": 100, "log": False, "type": "int"},    # [신규] 꼬리 영역의 이상치 개별 학습 차단
+    "reg_alpha": {"low": 0.01, "high": 50.0, "log": True, "type": "float"},        # [신규] L1 정규화 추가
+    "reg_lambda": {"low": 1.0, "high": 50.0, "log": True, "type": "float"},        # [수정] 10.0 -> 50.0 확대
 }
-
 ##### final 버전 - 최적화 하드코딩 #####
 # BEST_MODEL_CONFIG = {
 #     "kpx_group_1": {
@@ -367,20 +380,69 @@ LGBM_SEARCH_SPACE = {
 # }
 
 # test
-BEST_MODEL_CONFIG = {
-    "kpx_group_1": {
-        "XGB":  {"random_state": 42, "n_jobs": -1, "n_estimators": 499, "max_depth": 4, "learning_rate": 0.04195620299074925, "subsample": 0.7424364893339975, "colsample_bytree": 0.720932341890189, "reg_lambda": 4.542425989748594},
-        "LGBM": {"random_state": 42, "min_child_weight": 1.0, "verbosity": -1, "importance_type": "gain", "n_estimators": 660, "num_leaves": 68, "learning_rate": 0.059750451948554786, "subsample": 0.6023899357045669, "colsample_bytree": 0.8199638193192597, "reg_lambda": 2.9318471869411504},
-    },
-    "kpx_group_2": {
-        "XGB":  {"random_state": 42, "n_jobs": -1, "n_estimators": 469, "max_depth": 5, "learning_rate": 0.06249944751725576, "subsample": 0.9031934126795159, "colsample_bytree": 0.7426604485466712, "reg_lambda": 1.0622600189983782},
-        "LGBM": {"random_state": 42, "min_child_weight": 1.0, "verbosity": -1, "importance_type": "gain", "n_estimators": 776, "num_leaves": 106, "learning_rate": 0.018840552955192824, "subsample": 0.6390688456025535, "colsample_bytree": 0.8421165132560784, "reg_lambda": 2.7551959649510764},
-    },
-    "kpx_group_3": {
-        "XGB":  {"random_state": 42, "n_jobs": -1, "n_estimators": 228, "max_depth": 4, "learning_rate": 0.02977846306223348, "subsample": 0.7727780074568463, "colsample_bytree": 0.645614570099021, "reg_lambda": 4.091220574443785},
-        "LGBM": {"random_state": 42, "min_child_weight": 1.0, "verbosity": -1, "importance_type": "gain", "n_estimators": 448, "num_leaves": 33, "learning_rate": 0.04561487895116297, "subsample": 0.8468838671697153, "colsample_bytree": 0.728920203341694, "reg_lambda": 1.727665941743956},
-    },
-}
+BEST_MODEL_CONFIG = {   'kpx_group_1': {   'XGB': {   'random_state': 42,
+                                  'n_jobs': -1,
+                                  'n_estimators': 653,
+                                  'max_depth': 5,
+                                  'learning_rate': 0.07200972129001937,
+                                  'subsample': 0.6083450281598524,
+                                  'colsample_bytree': 0.6374396244003981,
+                                  'reg_alpha': 0.05661455992925891,
+                                  'reg_lambda': 12.248071740693057},
+                       'LGBM': {   'random_state': 42,
+                                   'min_child_weight': 1.0,
+                                   'verbosity': -1,
+                                   'importance_type': 'gain',
+                                   'n_estimators': 510,
+                                   'num_leaves': 30,
+                                   'learning_rate': 0.08556385477088213,
+                                   'subsample': 0.8075137588534191,
+                                   'colsample_bytree': 0.9538323976412588,
+                                   'min_child_samples': 79,
+                                   'reg_alpha': 1.656934810164938,
+                                   'reg_lambda': 42.1482899135715}},
+    'kpx_group_2': {   'XGB': {   'random_state': 42,
+                                  'n_jobs': -1,
+                                  'n_estimators': 252,
+                                  'max_depth': 5,
+                                  'learning_rate': 0.07772129529042913,
+                                  'subsample': 0.6145528174932546,
+                                  'colsample_bytree': 0.6992434423988387,
+                                  'reg_alpha': 0.2026052135232618,
+                                  'reg_lambda': 6.482471854220826},
+                       'LGBM': {   'random_state': 42,
+                                   'min_child_weight': 1.0,
+                                   'verbosity': -1,
+                                   'importance_type': 'gain',
+                                   'n_estimators': 428,
+                                   'num_leaves': 33,
+                                   'learning_rate': 0.0980824720234903,
+                                   'subsample': 0.8885518152054754,
+                                   'colsample_bytree': 0.728707588852926,
+                                   'min_child_samples': 100,
+                                   'reg_alpha': 0.014282823136097621,
+                                   'reg_lambda': 2.8414740414040787}},
+    'kpx_group_3': {   'XGB': {   'random_state': 42,
+                                  'n_jobs': -1,
+                                  'n_estimators': 450,
+                                  'max_depth': 5,
+                                  'learning_rate': 0.09696598214772,
+                                  'subsample': 0.6772876502180768,
+                                  'colsample_bytree': 0.5736494341677159,
+                                  'reg_alpha': 0.010981171680324257,
+                                  'reg_lambda': 2.187513785733947},
+                       'LGBM': {   'random_state': 42,
+                                   'min_child_weight': 1.0,
+                                   'verbosity': -1,
+                                   'importance_type': 'gain',
+                                   'n_estimators': 224,
+                                   'num_leaves': 63,
+                                   'learning_rate': 0.07913774978321361,
+                                   'subsample': 0.9425297333566303,
+                                   'colsample_bytree': 0.6898306742313617,
+                                   'min_child_samples': 43,
+                                   'reg_alpha': 7.911429383310936,
+                                   'reg_lambda': 6.317174291070384}}}
 
 # Baseline
 # BEST_LOSS_CONFIG = {
@@ -428,23 +490,25 @@ BEST_MODEL_CONFIG = {
 # }
 
 # test
-BEST_LOSS_CONFIG = {
-    "kpx_group_1": {
-        "XGB":  {"loss_name": "huber_capacity", "params": {"delta": 0.05101472208866336}},
-        "LGBM": {"loss_name": "huber_threshold", "params": {"delta": 0.15583931767075299, "amplitude": 0.7805498896204464, "sigma": 0.013707341249762393}},
+BEST_LOSS_CONFIG = {   "kpx_group_1": {
+        "XGB":  {"loss_name": "huber_threshold", "params": {"delta": 0.063, "amplitude": 3.19, "sigma": 0.0016}},
+        "LGBM": {"loss_name": "threshold_weighted", "params": {"amplitude": 0.400, "sigma": 0.0055}},
     },
-    "kpx_group_2": {
-        "XGB":  {"loss_name": "threshold_weighted", "params": {"amplitude": 2.9697158814524376, "sigma": 0.003542796928018529}},
-        "LGBM": {"loss_name": "threshold_weighted", "params": {"amplitude": 0.13853458335022473, "sigma": 0.04093813608598782}},
-    },
-    "kpx_group_3": {
-        "XGB":  {"loss_name": "huber_capacity", "params": {"delta": 0.06925598810528834}},
-        "LGBM": {"loss_name": "threshold_weighted", "params": {"amplitude": 3.775953662454377, "sigma": 0.013400087150160007}},
-    },
-}
+    'kpx_group_2': {   'XGB': {   'loss_name': 'threshold_weighted',
+                                  'params': {'amplitude': 1.3993049448224455, 'sigma': 0.009623602461691394}},
+                       'LGBM': {   'loss_name': 'threshold_weighted',
+                                   'params': {'amplitude': 10.570115773437378, 'sigma': 0.005215860735621829}}},
+    'kpx_group_3': {   'XGB': {   'loss_name': 'huber_threshold',
+                                  'params': {   'delta': 0.20251098068098403,
+                                                'amplitude': 4.374902392062924,
+                                                'sigma': 0.030258194528342205}},
+                       'LGBM': {   'loss_name': 'threshold_weighted',
+                                   'params': {'amplitude': 2.0394594616391517, 'sigma': 0.0011357408153864035}}}}
 
 
 # Chronos 모델 설정 (Chronos-2 기반)
 # CHRONOS_MODEL_PATH = "amazon/chronos-bolt-small"
+# CHRONOS_MODEL_PATH = "amazon/chronos-t5-small"
+CHRONOS_MODEL_PATH = "amazon/chronos-t5-large"
 # CHRONOS_MODEL_PATH = "amazon/chronos-2"
-CHRONOS_MODEL_PATH = "autogluon/chronos-2"
+# CHRONOS_MODEL_PATH = "autogluon/chronos-2"

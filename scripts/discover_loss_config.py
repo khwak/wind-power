@@ -55,5 +55,44 @@ if __name__ == "__main__":
     with open(proposed_path, "w", encoding="utf-8") as f:
         json.dump(proposed_config, f, ensure_ascii=False, indent=2)
     print(f"📊 제안 config 저장: {proposed_path}")
-    print("\n⚠️  config.py의 BEST_LOSS_CONFIG는 자동 반영되지 않았습니다. "
-          "위 결과를 확인하고 직접 옮겨 적용하세요.")
+
+    # --- config.py 자동 반영 로직 ---
+    import re
+    import pprint
+    from pathlib import Path
+
+    config_file_path = Path(__file__).resolve().parent / "config.py"
+    
+    try:
+        with open(config_file_path, "r", encoding="utf-8") as f:
+            config_content = f.read()
+
+        best_loss_config = {}
+        best_model_config = {}
+        for t, conf in proposed_config.items():
+            best_loss_config[t] = {
+                "XGB": {"loss_name": conf["XGB"]["loss_name"], "params": conf["XGB"]["params"]},
+                "LGBM": {"loss_name": conf["LGBM"]["loss_name"], "params": conf["LGBM"]["params"]},
+            }
+            best_model_config[t] = {
+                "XGB": conf["XGB"]["model_params"],
+                "LGBM": conf["LGBM"]["model_params"],
+            }
+
+        # 딕셔너리를 보기 좋은 문자열 형태로 변환
+        loss_str = "BEST_LOSS_CONFIG = " + pprint.pformat(best_loss_config, indent=4, sort_dicts=False, width=120)
+        model_str = "BEST_MODEL_CONFIG = " + pprint.pformat(best_model_config, indent=4, sort_dicts=False, width=120)
+
+        # 정규표현식을 통해 기존 딕셔너리 블록을 찾아 교체
+        # 다중 줄 모드(re.MULTILINE)와 모든 문자 매칭(re.DOTALL)을 사용해 안전하게 치환
+        config_content = re.sub(r'^BEST_MODEL_CONFIG\s*=\s*\{.*?\}(?=\n*(?:#|[A-Z]|$))', model_str, config_content, flags=re.MULTILINE | re.DOTALL)
+        config_content = re.sub(r'^BEST_LOSS_CONFIG\s*=\s*\{.*?\}(?=\n*(?:#|[A-Z]|$))', loss_str, config_content, flags=re.MULTILINE | re.DOTALL)
+
+        with open(config_file_path, "w", encoding="utf-8") as f:
+            f.write(config_content)
+            
+        print(f"✅ config.py 파일에 BEST_MODEL_CONFIG 및 BEST_LOSS_CONFIG 자동 반영 완료!")
+        
+    except Exception as e:
+        print(f"❌ config.py 자동 반영 중 오류 발생: {e}")
+        print("⚠️ 수동으로 업데이트를 진행해주세요.")
